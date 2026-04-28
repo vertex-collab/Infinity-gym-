@@ -1,0 +1,1681 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>InfinityGym</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet"/>
+<script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Inter',sans-serif;background:#000;color:#fff}
+input,select,textarea,button{font-family:'Inter',sans-serif}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes fadein{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+::-webkit-scrollbar{width:5px}
+::-webkit-scrollbar-thumb{background:#3f3f46;border-radius:3px}
+input[type=date]::-webkit-calendar-picker-indicator{filter:invert(1);cursor:pointer}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const{useState,useEffect,useRef}=React;
+
+// ── AUTH ──────────────────────────────────────────────────────
+const SEC="igym2024";
+async function hashPw(pw){
+  const d=new TextEncoder().encode(pw+SEC);
+  const h=await crypto.subtle.digest("SHA-256",d);
+  return Array.from(new Uint8Array(h)).map(b=>b.toString(16).padStart(2,"0")).join("");
+}
+async function chkPw(pw,hash){return(await hashPw(pw))===hash;}
+function mkTok(p){return btoa(JSON.stringify({...p,iat:Date.now()}));}
+function rdTok(t){try{return JSON.parse(atob(t));}catch{return null;}}
+
+// ── SESSION ───────────────────────────────────────────────────
+let _sess=null;
+function getSess(){if(_sess)return _sess;const t=localStorage.getItem("igym_tok");if(!t)return null;const p=rdTok(t);_sess=p;return p;}
+function setSess(tok,u){_sess=u;localStorage.setItem("igym_tok",tok);}
+function clrSess(){_sess=null;localStorage.removeItem("igym_tok");}
+
+// ── CONFIG ────────────────────────────────────────────────────
+const DEF={
+  logoText:"INFINITY",logoAccent:"GYM",primary:"#f97316",accent:"#dc2626",
+  heroTitle:"FORGE YOUR",heroHL:"BEST SELF",
+  heroSub:"Personalized workout plans, custom diet programs, and expert trainers — all managed through our smart gym platform.",
+  heroBadge:"India's #1 Smart Gym",
+  s1v:"2,500+",s1l:"Active Members",s2v:"50+",s2l:"Expert Trainers",
+  s3v:"15+",s3l:"Years Experience",s4v:"98%",s4l:"Success Rate",
+  phone:"+91 98765 43210",email:"admin@infinitygym.com",
+  address:"123 Fitness Street, Mumbai",wa:"919876543210",
+  hours:"Open 6am–11pm daily",footer:"© 2024 Infinity Gym. All rights reserved.",pin:"admin123",
+};
+// getCfg and saveCfg defined below in FIRESTORE REST section
+
+// ── FIRESTORE REST API (No SDK — works from any file:// or https://) ───────────
+const FB_PROJECT = "pwd-infinity-gym";
+const FB_API_KEY = "AIzaSyDk8Ojr_jELgnFcKmkVKc7C270UsfG4vDI";
+const FB_BASE = `https://firestore.googleapis.com/v1/projects/${FB_PROJECT}/databases/(default)/documents`;
+
+// Convert Firestore REST value → JS value
+function fsVal(v){
+  if(!v)return null;
+  if(v.stringValue!==undefined)return v.stringValue;
+  if(v.integerValue!==undefined)return parseInt(v.integerValue);
+  if(v.doubleValue!==undefined)return parseFloat(v.doubleValue);
+  if(v.booleanValue!==undefined)return v.booleanValue;
+  if(v.nullValue!==undefined)return null;
+  if(v.mapValue)return fsDoc(v.mapValue.fields||{});
+  if(v.arrayValue)return(v.arrayValue.values||[]).map(fsVal);
+  return null;
+}
+// Convert Firestore REST fields → plain JS object
+function fsDoc(fields){
+  const o={};
+  for(const k in fields)o[k]=fsVal(fields[k]);
+  return o;
+}
+// Convert JS value → Firestore REST value
+function toFsVal(v){
+  if(v===null||v===undefined)return{nullValue:null};
+  if(typeof v==="boolean")return{booleanValue:v};
+  if(typeof v==="number")return Number.isInteger(v)?{integerValue:String(v)}:{doubleValue:v};
+  if(typeof v==="string")return{stringValue:v};
+  if(Array.isArray(v))return{arrayValue:{values:v.map(toFsVal)}};
+  if(typeof v==="object"){
+    const fields={};
+    for(const k in v)fields[k]=toFsVal(v[k]);
+    return{mapValue:{fields}};
+  }
+  return{stringValue:String(v)};
+}
+// Convert plain JS object → Firestore REST fields
+function toFsFields(obj){
+  const fields={};
+  for(const k in obj)fields[k]=toFsVal(obj[k]);
+  return fields;
+}
+
+async function dbGetAll(col){
+  const url=`${FB_BASE}/${col}?key=${FB_API_KEY}`;
+  const res=await fetch(url);
+  if(!res.ok)return[];
+  const json=await res.json();
+  if(!json.documents)return[];
+  return json.documents.map(doc=>{
+    const id=doc.name.split("/").pop();
+    return{id,...fsDoc(doc.fields||{})};
+  });
+}
+
+async function dbGetWhere(col,field,op,val){
+  // Use Firestore runQuery REST endpoint for where queries
+  const url=`${FB_BASE}:runQuery?key=${FB_API_KEY}`;
+  const fsOp={
+    "==":"EQUAL","<":"LESS_THAN","<=":"LESS_THAN_OR_EQUAL",
+    ">":"GREATER_THAN",">=":"GREATER_THAN_OR_EQUAL"
+  }[op]||"EQUAL";
+  const body={structuredQuery:{
+    from:[{collectionId:col}],
+    where:{fieldFilter:{field:{fieldPath:field},op:fsOp,value:toFsVal(val)}}
+  }};
+  const res=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  if(!res.ok)return[];
+  const json=await res.json();
+  return json
+    .filter(r=>r.document)
+    .map(r=>{const id=r.document.name.split("/").pop();return{id,...fsDoc(r.document.fields||{})};});
+}
+
+async function dbSet(col,id,data){
+  // PATCH with updateMask = all field names (creates or updates)
+  const fields=toFsFields(data);
+  const fieldPaths=Object.keys(fields).map(k=>`updateMask.fieldPaths=${encodeURIComponent(k)}`).join("&");
+  const url=`${FB_BASE}/${col}/${id}?${fieldPaths}&key=${FB_API_KEY}`;
+  const res=await fetch(url,{
+    method:"PATCH",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({fields})
+  });
+  if(!res.ok){const t=await res.text();throw new Error("dbSet failed: "+t);}
+}
+
+async function dbDelete(col,id){
+  const url=`${FB_BASE}/${col}/${id}?key=${FB_API_KEY}`;
+  const res=await fetch(url,{method:"DELETE"});
+  if(!res.ok&&res.status!==404){const t=await res.text();throw new Error("dbDelete failed: "+t);}
+}
+
+async function dbGetDoc(col,id){
+  const url=`${FB_BASE}/${col}/${id}?key=${FB_API_KEY}`;
+  const res=await fetch(url);
+  if(!res.ok)return null;
+  const doc=await res.json();
+  if(!doc.name)return null;
+  return{id:doc.name.split("/").pop(),...fsDoc(doc.fields||{})};
+}
+
+// Config helpers — stored as single doc "site" in igym_cfg collection
+const getCfg=()=>{try{return{...DEF,...JSON.parse(localStorage.getItem("igym_cfg")||"{}")};}catch{return{...DEF};}};
+async function getCfgRemote(){
+  try{
+    const d=await dbGetDoc("igym_cfg","site");
+    if(d){const{id,...rest}=d;localStorage.setItem("igym_cfg",JSON.stringify(rest));return{...DEF,...rest};}
+  }catch(e){console.warn("cfg fetch failed",e);}
+  return getCfg();
+}
+const saveCfg=async c=>{
+  localStorage.setItem("igym_cfg",JSON.stringify(c));
+  window.dispatchEvent(new Event("cfgChange"));
+  try{await dbSet("igym_cfg","site",c);}catch(e){console.warn("cfg save failed",e);}
+};
+
+const today=()=>new Date().toISOString().split("T")[0];
+const addDays=(d,n)=>{const dt=new Date(d+"T12:00:00");dt.setDate(dt.getDate()+n);return dt.toISOString().split("T")[0];};
+const fmtDate=d=>new Date(d+"T12:00:00").toLocaleDateString("en-IN",{weekday:"long",day:"numeric",month:"long",year:"numeric"});
+
+// Legacy localStorage shim (used only for session, no longer for app data)
+const lsGet=(k,d=[])=>{try{return JSON.parse(localStorage.getItem(k))||d;}catch{return d;}};
+const lsSet=(k,v)=>localStorage.setItem(k,JSON.stringify(v));
+
+async function seedDB(){
+  if(localStorage.getItem("igym_fb_seeded"))return;
+  // Check if Firestore already has members (avoid re-seeding on other devices)
+  try{
+    const existing=await dbGetAll("igym_members");
+    if(existing.length>0){localStorage.setItem("igym_fb_seeded","1");return;}
+  }catch(e){console.warn("seed check failed",e);}
+  const aH=await hashPw("admin123"),mH=await hashPw("member123");
+  const members=[
+    {member_id:"ADMIN001",name:"Admin",email:"admin@infinitygym.com",password_hash:aH,role:"admin",status:"active"},
+    {member_id:"GYM001",name:"Rahul Sharma",email:"rahul@example.com",password_hash:mH,role:"member",phone:"+91 9876500001",age:25,weight:75,height:175,goal:"Weight Loss",plan:"Premium",status:"active"},
+    {member_id:"GYM002",name:"Priya Singh",email:"priya@example.com",password_hash:mH,role:"member",phone:"+91 9876500002",age:28,weight:60,height:162,goal:"Muscle Gain",plan:"Elite",status:"active"},
+  ];
+  for(const m of members){
+    try{await dbSet("igym_members",m.member_id==="ADMIN001"?"admin1":m.member_id==="GYM001"?"m1":"m2",m);}catch(e){console.warn(e);}
+  }
+  const td=today();
+  try{
+    await dbSet("igym_diet","dp1",{member_id:"m1",date:td,total_cal:1530,notes:"Drink 3-4 liters of water",
+      breakfast:{name:"Oats with Banana & Almonds",cal:350,protein:12,carbs:55,fat:8,notes:"Add honey"},
+      lunch:{name:"Grilled Chicken with Brown Rice",cal:520,protein:45,carbs:50,fat:10,notes:""},
+      dinner:{name:"Paneer Tikka with Roti",cal:480,protein:30,carbs:45,fat:15,notes:""},
+      snacks:{name:"Greek Yogurt with Berries",cal:180,protein:15,carbs:20,fat:3,notes:""},
+    });
+    await dbSet("igym_workout","wp1",{member_id:"m1",date:td,type:"Upper Body",duration:"60 mins",notes:"Focus on form",
+      exercises:[
+        {name:"Bench Press",sets:4,reps:10,weight:"60kg",muscle:"Chest",link:"",notes:""},
+        {name:"Pull Ups",sets:3,reps:8,weight:"",muscle:"Back",link:"",notes:""},
+        {name:"Shoulder Press",sets:3,reps:12,weight:"30kg",muscle:"Shoulders",link:"",notes:""},
+        {name:"Bicep Curls",sets:3,reps:15,weight:"15kg",muscle:"Biceps",link:"",notes:""},
+      ],
+    });
+    await dbSet("igym_plans","pl1",{name:"Basic",price:999,duration:30,features:["Gym Access","Locker Room","Basic Equipment"],desc:"Perfect for beginners",badge:"",hl:false});
+    await dbSet("igym_plans","pl2",{name:"Premium",price:1999,duration:30,features:["Gym Access","Personal Trainer (2x/week)","Diet Plan","Workout Plan"],desc:"Most popular",badge:"Most Popular",hl:true});
+    await dbSet("igym_plans","pl3",{name:"Elite",price:3999,duration:30,features:["24/7 Access","Daily Personal Trainer","Custom Diet Plan","Custom Workout Plan","Supplements"],desc:"For serious athletes",badge:"Best Value",hl:false});
+  }catch(e){console.warn("seed data failed",e);}
+  localStorage.setItem("igym_fb_seeded","1");
+}
+
+// ── UTILS ─────────────────────────────────────────────────────
+const G=c=>`linear-gradient(135deg,${c.primary},${c.accent})`;
+const GT=c=>({background:G(c),WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",backgroundClip:"text"});
+
+// ── TINY ICONS ────────────────────────────────────────────────
+const IP={
+  Infinity:<><path d="M12 12c-2-2.5-4-4-6-4a4 4 0 0 0 0 8c2 0 4-1.5 6-4zm0 0c2 2.5 4 4 6 4a4 4 0 0 0 0-8c-2 0-4 1.5-6 4z"/></>,
+  Dumbbell:<><path d="M6 5v14M18 5v14M6 8h12M6 16h12M3 8h3M18 8h3M3 16h3M18 16h3"/></>,
+  Users:<><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></>,
+  Utensils:<><path d="M3 2v7c0 1.1.9 2 2 2h4a2 2 0 0 0 2-2V2M7 2v20M21 15V2a5 5 0 0 0-5 5v6c0 1.1.9 2 2 2h3v7"/></>,
+  CreditCard:<><rect x="1" y="4" width="22" height="16" rx="2"/><line x1="1" y1="10" x2="23" y2="10"/></>,
+  Dashboard:<><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></>,
+  LogOut:<><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></>,
+  Plus:<><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></>,
+  Edit:<><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></>,
+  Trash:<><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></>,
+  Search:<><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></>,
+  Save:<><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></>,
+  X:<><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></>,
+  ChevL:<><polyline points="15 18 9 12 15 6"/></>,
+  ChevR:<><polyline points="9 18 15 12 9 6"/></>,
+  ChevD:<><polyline points="6 9 12 15 18 9"/></>,
+  Eye:<><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></>,
+  EyeOff:<><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></>,
+  Check:<><polyline points="20 6 9 17 4 12"/></>,
+  Flame:<><path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/></>,
+  Phone:<><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 13 19.79 19.79 0 0 1 1.61 4.3 2 2 0 0 1 3.6 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L7.91 9.91a16 16 0 0 0 6 6l.92-.92a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></>,
+  Mail:<><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></>,
+  MapPin:<><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></>,
+  Msg:<><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></>,
+  Zap:<><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></>,
+  Heart:<><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></>,
+  Shield:<><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></>,
+  Target:<><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></>,
+  Activity:<><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></>,
+  Award:<><circle cx="12" cy="8" r="7"/><polyline points="8.21 13.89 7 23 12 20 17 23 15.79 13.88"/></>,
+  Coffee:<><path d="M17 8h1a4 4 0 1 1 0 8h-1M3 8h14v9a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4V8zM6 2v2M10 2v2M14 2v2"/></>,
+  Sun:<><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/></>,
+  Moon:<><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></>,
+  Apple:<><path d="M12 20.94c1.5 0 4.5 1.06 4.5 1.06V19s3-4 3-8c0-4-3.5-8-7.5-8S4.5 7 4.5 11c0 4 3 8 3 8v2.94s3-1 4.5-1zM12 7V3"/></>,
+  Settings:<><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></>,
+  Arrow:<><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></>,
+  Play:<><polygon points="5 3 19 12 5 21 5 3"/></>,
+};
+function Ic({n,s=18,c,fill}){
+  const p=IP[n];if(!p)return null;
+  return <svg width={s} height={s} viewBox="0 0 24 24" fill={fill||"none"} stroke={c||"currentColor"} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{flexShrink:0}}>{p}</svg>;
+}
+const Spin=({s=20,c="#f97316"})=><div style={{width:s,height:s,border:`3px solid ${c}30`,borderTopColor:c,borderRadius:"50%",animation:"spin .7s linear infinite"}}/>;
+
+function Toast({msg,type,onDone}){
+  useEffect(()=>{const t=setTimeout(onDone,3000);return()=>clearTimeout(t);},[]);
+  const bg={success:"#22c55e",error:"#ef4444",info:"#3b82f6"}[type]||"#22c55e";
+  return <div style={{position:"fixed",top:20,right:20,zIndex:9999,background:bg,color:"#fff",padding:"12px 20px",borderRadius:12,fontWeight:600,fontSize:14,boxShadow:"0 10px 30px rgba(0,0,0,.4)",maxWidth:320,animation:"fadein .3s ease"}}>{msg}</div>;
+}
+
+function Modal({title,onClose,children,wide}){
+  return(
+    <div onClick={e=>e.target===e.currentTarget&&onClose()} style={{position:"fixed",inset:0,zIndex:999,background:"rgba(0,0,0,.82)",display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
+      <div style={{background:"#18181b",border:"1px solid rgba(255,255,255,.1)",borderRadius:20,width:"100%",maxWidth:wide?700:520,maxHeight:"90vh",overflow:"auto",boxShadow:"0 25px 60px rgba(0,0,0,.6)",animation:"fadein .2s ease"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"18px 22px",borderBottom:"1px solid rgba(255,255,255,.08)"}}>
+          <h3 style={{color:"#fff",fontWeight:800,fontSize:17}}>{title}</h3>
+          <button onClick={onClose} style={{background:"rgba(255,255,255,.08)",border:"none",color:"#9ca3af",borderRadius:8,padding:"5px 7px",cursor:"pointer",display:"flex"}}><Ic n="X" s={16}/></button>
+        </div>
+        <div style={{padding:22}}>{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function Field({label,value,onChange,type="text",placeholder,sx={}}){
+  const p=getCfg().primary;
+  return(
+    <div>
+      {label&&<label style={{display:"block",color:"#d1d5db",fontSize:13,fontWeight:600,marginBottom:5}}>{label}</label>}
+      <input type={type} value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder}
+        style={{width:"100%",background:"#27272a",border:"1px solid rgba(255,255,255,.12)",borderRadius:10,padding:"9px 13px",color:"#fff",fontSize:14,outline:"none",...sx}}
+        onFocus={e=>e.target.style.borderColor=p} onBlur={e=>e.target.style.borderColor="rgba(255,255,255,.12)"}/>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+//  NAVBAR  ← 5-tap logo triggers PIN → Customizer
+// ══════════════════════════════════════════════════════════════
+function Navbar({page,setPage}){
+  const [cfg,setCfg]=useState(getCfg());
+  const [taps,setTaps]=useState(0);
+  const [showPin,setShowPin]=useState(false);
+  const [showCust,setShowCust]=useState(false);
+  const [pin,setPin]=useState("");
+  const [pinErr,setPinErr]=useState("");
+  const [drop,setDrop]=useState(false);
+  const tapRef=useRef(null);
+  const user=getSess();
+
+  useEffect(()=>{
+    const h=()=>setCfg(getCfg());
+    window.addEventListener("cfgChange",h);
+    return()=>window.removeEventListener("cfgChange",h);
+  },[]);
+
+  const logoTap=()=>{
+    setTaps(prev=>{
+      const n=prev+1;
+      clearTimeout(tapRef.current);
+      tapRef.current=setTimeout(()=>setTaps(0),2000);
+      if(n>=5){
+        setTaps(0);
+        setShowPin(true);
+        setPin("");
+        setPinErr("");
+      }
+      return n<5?n:0;
+    });
+  };
+
+  const submitPin=e=>{
+    e.preventDefault();
+    if(pin===getCfg().pin){setShowPin(false);setShowCust(true);}
+    else{setPinErr("Wrong PIN – try again");setPin("");}
+  };
+
+  const g=G(cfg);
+
+  return(
+    <>
+    <nav style={{position:"fixed",top:0,left:0,right:0,zIndex:200,background:"rgba(0,0,0,.9)",backdropFilter:"blur(16px)",borderBottom:"1px solid rgba(255,255,255,.08)",height:64,display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0 20px"}}>
+      {/* LOGO – tap 5x */}
+      <div style={{position:"relative"}}>
+        <button onClick={logoTap} style={{display:"flex",alignItems:"center",gap:8,background:"none",border:"none",cursor:"pointer",padding:4}}>
+          <div style={{width:36,height:36,borderRadius:10,background:g,display:"flex",alignItems:"center",justifyContent:"center"}}>
+            <Ic n="Infinity" s={20} c="#fff"/>
+          </div>
+          <span style={{color:"#fff",fontWeight:900,fontSize:18}}>
+            {cfg.logoText}<span style={{color:cfg.primary}}>{cfg.logoAccent}</span>
+          </span>
+        </button>
+        {taps>0&&(
+          <div style={{position:"absolute",bottom:-16,left:4,display:"flex",gap:3}}>
+            {[1,2,3,4,5].map(d=>(
+              <div key={d} style={{width:6,height:6,borderRadius:"50%",background:d<=taps?cfg.primary:"#3f3f46",transition:"background .15s"}}/>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {page==="landing"&&(
+        <div style={{display:"flex",gap:22}}>
+          {[["services","Services"],["plans","Plans"],["contact","Contact"]].map(([id,l])=>(
+            <a key={id} href={"#"+id} style={{color:"#9ca3af",textDecoration:"none",fontSize:14,fontWeight:500}}
+              onMouseEnter={e=>e.target.style.color=cfg.primary}
+              onMouseLeave={e=>e.target.style.color="#9ca3af"}>{l}</a>
+          ))}
+        </div>
+      )}
+
+      <div style={{display:"flex",alignItems:"center",gap:10}}>
+        {user?(
+          <div style={{position:"relative"}}>
+            <button onClick={()=>setDrop(!drop)} style={{display:"flex",alignItems:"center",gap:8,background:"rgba(255,255,255,.08)",border:"1px solid rgba(255,255,255,.14)",borderRadius:12,padding:"6px 12px",cursor:"pointer"}}>
+              <div style={{width:28,height:28,borderRadius:"50%",background:g,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:700,fontSize:13}}>{user.name?.[0]}</div>
+              <span style={{color:"#fff",fontSize:13,fontWeight:600}}>{user.name?.split(" ")[0]}</span>
+              <Ic n="ChevD" s={14} c="#9ca3af"/>
+            </button>
+            {drop&&(
+              <div style={{position:"absolute",right:0,top:"calc(100% + 8px)",background:"#18181b",border:"1px solid rgba(255,255,255,.1)",borderRadius:14,minWidth:180,boxShadow:"0 20px 40px rgba(0,0,0,.5)",overflow:"hidden",zIndex:300,animation:"fadein .15s ease"}}>
+                <div style={{padding:"12px 16px",borderBottom:"1px solid rgba(255,255,255,.08)"}}>
+                  <div style={{color:"#fff",fontWeight:700,fontSize:14}}>{user.name}</div>
+                  <div style={{color:"#6b7280",fontSize:12,marginTop:2}}>{user.member_id} · <span style={{color:cfg.primary}}>{user.role}</span></div>
+                </div>
+                <button onClick={()=>{setPage(user.role==="admin"?"admin":"dashboard");setDrop(false);}} style={{width:"100%",display:"flex",alignItems:"center",gap:8,padding:"10px 16px",background:"none",border:"none",color:"#d1d5db",fontSize:13,cursor:"pointer"}}>
+                  <Ic n="Dashboard" s={14}/>Dashboard
+                </button>
+                <button onClick={()=>{clrSess();setPage("landing");setDrop(false);}} style={{width:"100%",display:"flex",alignItems:"center",gap:8,padding:"10px 16px",background:"none",border:"none",color:"#f87171",fontSize:13,cursor:"pointer"}}>
+                  <Ic n="LogOut" s={14}/>Logout
+                </button>
+              </div>
+            )}
+          </div>
+        ):(
+          <button onClick={()=>setPage("login")} style={{background:g,border:"none",color:"#fff",fontWeight:700,padding:"8px 18px",borderRadius:12,cursor:"pointer",fontSize:14}}>
+            Member Login
+          </button>
+        )}
+      </div>
+    </nav>
+
+    {/* ── PIN MODAL ── */}
+    {showPin&&(
+      <div onClick={e=>e.target===e.currentTarget&&setShowPin(false)}
+        style={{position:"fixed",inset:0,zIndex:500,background:"rgba(0,0,0,.85)",display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
+        <div style={{background:"#18181b",border:"1px solid rgba(255,255,255,.1)",borderRadius:22,padding:36,width:"100%",maxWidth:360,textAlign:"center",animation:"fadein .2s ease"}}>
+          <div style={{width:60,height:60,borderRadius:16,background:g,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 16px"}}>
+            <Ic n="Settings" s={28} c="#fff"/>
+          </div>
+          <h3 style={{color:"#fff",fontWeight:900,fontSize:20,marginBottom:6}}>Site Customizer</h3>
+          <p style={{color:"#6b7280",fontSize:14,marginBottom:22}}>Enter PIN to unlock settings</p>
+          <form onSubmit={submitPin}>
+            <input type="password" value={pin} onChange={e=>{setPin(e.target.value);setPinErr("");}}
+              placeholder="Enter PIN" autoFocus
+              style={{width:"100%",background:"#27272a",border:`1px solid ${pinErr?"#ef4444":"rgba(255,255,255,.2)"}`,borderRadius:12,padding:"12px 16px",color:"#fff",fontSize:20,textAlign:"center",letterSpacing:8,outline:"none",marginBottom:8}}/>
+            {pinErr&&<p style={{color:"#f87171",fontSize:13,marginBottom:8}}>{pinErr}</p>}
+            <button type="submit" style={{width:"100%",background:g,border:"none",color:"#fff",fontWeight:700,padding:13,borderRadius:12,cursor:"pointer",fontSize:15,marginBottom:8}}>
+              🔓 Unlock
+            </button>
+            <button type="button" onClick={()=>setShowPin(false)} style={{background:"none",border:"none",color:"#6b7280",fontSize:13,cursor:"pointer"}}>Cancel</button>
+          </form>
+          <p style={{color:"#374151",fontSize:12,marginTop:14}}>Default PIN: <b style={{color:"#6b7280"}}>admin123</b></p>
+        </div>
+      </div>
+    )}
+
+    {/* ── CUSTOMIZER ── */}
+    {showCust&&<Customizer cfg={cfg} onSave={c=>{saveCfg(c);setCfg(c);setShowCust(false);}} onClose={()=>setShowCust(false)} onAdminPanel={()=>{clrSess();setPage("adminLogin");}}/>}
+    </>
+  );
+}
+
+function Customizer({cfg,onSave,onClose,onAdminPanel}){
+  const [f,setF]=useState({...cfg});
+  const u=v=>setF(p=>({...p,...v}));
+  const g=G(f);
+  return(
+    <div style={{position:"fixed",inset:0,zIndex:400,background:"rgba(0,0,0,.6)",display:"flex",justifyContent:"flex-end"}}>
+      <div style={{width:"100%",maxWidth:420,background:"#09090b",borderLeft:"1px solid rgba(255,255,255,.1)",overflowY:"auto",padding:24,animation:"fadein .2s ease"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:22}}>
+          <h2 style={{color:"#fff",fontWeight:900,fontSize:19}}>⚙️ Site Customizer</h2>
+          <button onClick={onClose} style={{background:"rgba(255,255,255,.08)",border:"none",color:"#9ca3af",borderRadius:8,padding:"5px 7px",cursor:"pointer",display:"flex"}}><Ic n="X" s={16}/></button>
+        </div>
+        {/* Admin Panel shortcut */}
+        <button onClick={()=>{onClose();onAdminPanel();}} style={{width:"100%",display:"flex",alignItems:"center",justifyContent:"center",gap:10,background:g,border:"none",color:"#fff",fontWeight:700,padding:"12px 18px",borderRadius:14,cursor:"pointer",fontSize:15,marginBottom:22,boxShadow:"0 8px 24px rgba(249,115,22,.3)"}}>
+          <Ic n="Dashboard" s={18} c="#fff"/>Open Admin Panel
+        </button>
+        {/* ── PHOTOS ── */}
+        <div style={{marginBottom:10}}>
+          <p style={{color:"#9ca3af",fontSize:12,fontWeight:700,textTransform:"uppercase",letterSpacing:1,marginBottom:10}}>📸 Photos</p>
+          <div style={{background:"#18181b",border:"1px solid rgba(255,255,255,.1)",borderRadius:14,padding:14,marginBottom:10}}>
+            <label style={{color:"#d1d5db",fontSize:13,fontWeight:600,display:"block",marginBottom:6}}>Hero Background Image</label>
+            {f.heroBg&&<img src={f.heroBg} alt="hero" style={{width:"100%",height:90,objectFit:"cover",borderRadius:10,marginBottom:8}}/>}
+            <label style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8,background:"rgba(255,255,255,.07)",border:"1px dashed rgba(255,255,255,.2)",borderRadius:10,padding:"10px 14px",cursor:"pointer",color:"#9ca3af",fontSize:13,fontWeight:600}}>
+              <Ic n="Plus" s={15} c="#9ca3af"/>{f.heroBg?"Change Image":"Upload Image"}
+              <input type="file" accept="image/*" style={{display:"none"}} onChange={e=>{const file=e.target.files[0];if(!file)return;const r=new FileReader();r.onload=ev=>u({heroBg:ev.target.result});r.readAsDataURL(file);}}/>
+            </label>
+            {f.heroBg&&<button onClick={()=>u({heroBg:""})} style={{marginTop:6,background:"none",border:"none",color:"#f87171",fontSize:12,cursor:"pointer",width:"100%"}}>✕ Remove</button>}
+          </div>
+          <div style={{background:"#18181b",border:"1px solid rgba(255,255,255,.1)",borderRadius:14,padding:14}}>
+            <label style={{color:"#d1d5db",fontSize:13,fontWeight:600,display:"block",marginBottom:6}}>Gallery Photos <span style={{color:"#6b7280",fontWeight:400}}>(up to 6)</span></label>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:8}}>
+              {(f.gallery||[]).map((img,i)=>(
+                <div key={i} style={{position:"relative"}}>
+                  <img src={img} alt="" style={{width:"100%",height:70,objectFit:"cover",borderRadius:8}}/>
+                  <button onClick={()=>u({gallery:(f.gallery||[]).filter((_,j)=>j!==i)})} style={{position:"absolute",top:3,right:3,background:"rgba(0,0,0,.7)",border:"none",color:"#f87171",borderRadius:"50%",width:20,height:20,cursor:"pointer",fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",padding:0}}><Ic n="X" s={10} c="#f87171"/></button>
+                </div>
+              ))}
+              {(f.gallery||[]).length<6&&(
+                <label style={{height:70,display:"flex",alignItems:"center",justifyContent:"center",background:"rgba(255,255,255,.05)",border:"1px dashed rgba(255,255,255,.2)",borderRadius:8,cursor:"pointer",color:"#6b7280"}}>
+                  <Ic n="Plus" s={20} c="#6b7280"/>
+                  <input type="file" accept="image/*" style={{display:"none"}} onChange={e=>{const file=e.target.files[0];if(!file)return;const r=new FileReader();r.onload=ev=>u({gallery:[...(f.gallery||[]),ev.target.result]});r.readAsDataURL(file);}}/>
+                </label>
+              )}
+            </div>
+          </div>
+        </div>
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          <p style={{color:"#9ca3af",fontSize:12,fontWeight:700,textTransform:"uppercase",letterSpacing:1,marginTop:4,marginBottom:2}}>🔧 Site Settings</p>
+          {[["Logo Text","logoText"],["Logo Accent","logoAccent"],["Hero Title","heroTitle"],["Hero Highlight","heroHL"],["Hero Badge","heroBadge"],["Phone","phone"],["Email","email"],["Address","address"],["WhatsApp No.","wa"],["Admin PIN","pin"]].map(([l,k])=>(
+            <Field key={k} label={l} value={f[k]||""} onChange={v=>u({[k]:v})}/>
+          ))}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <div>
+              <label style={{color:"#d1d5db",fontSize:13,fontWeight:600,display:"block",marginBottom:5}}>Primary Color</label>
+              <input type="color" value={f.primary} onChange={e=>u({primary:e.target.value})} style={{width:"100%",height:44,borderRadius:10,border:"1px solid rgba(255,255,255,.2)",background:"none",cursor:"pointer"}}/>
+            </div>
+            <div>
+              <label style={{color:"#d1d5db",fontSize:13,fontWeight:600,display:"block",marginBottom:5}}>Accent Color</label>
+              <input type="color" value={f.accent} onChange={e=>u({accent:e.target.value})} style={{width:"100%",height:44,borderRadius:10,border:"1px solid rgba(255,255,255,.2)",background:"none",cursor:"pointer"}}/>
+            </div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+            {[["s1v","Stat 1"],["s1l","Label 1"],["s2v","Stat 2"],["s2l","Label 2"],["s3v","Stat 3"],["s3l","Label 3"],["s4v","Stat 4"],["s4l","Label 4"]].map(([k,l])=>(
+              <Field key={k} label={l} value={f[k]||""} onChange={v=>u({[k]:v})}/>
+            ))}
+          </div>
+        </div>
+        <button onClick={()=>onSave(f)} style={{width:"100%",marginTop:18,background:g,border:"none",color:"#fff",fontWeight:700,padding:13,borderRadius:12,cursor:"pointer",fontSize:15}}>
+          💾 Save Changes
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+//  LANDING PAGE
+// ══════════════════════════════════════════════════════════════
+function Landing({setPage}){
+  const [cfg,setCfg]=useState(getCfg());
+  const [plans,setPlans]=useState([]);
+  useEffect(()=>{
+    // Load plans from Firestore on mount
+    dbGetAll("igym_plans").then(p=>setPlans(p)).catch(()=>{});
+    const h=async()=>{
+      setCfg(getCfg());
+      try{setPlans(await dbGetAll("igym_plans"));}catch(e){}
+    };
+    window.addEventListener("cfgChange",h);
+    return()=>window.removeEventListener("cfgChange",h);
+  },[]);
+  const g=G(cfg),gt=GT(cfg),p=cfg.primary;
+  const svcs=[
+    {i:"Dumbbell",t:"Strength Training",d:"Build muscle with expert-curated strength programs tailored to your goals."},
+    {i:"Flame",t:"Cardio & HIIT",d:"Burn fat fast with high-intensity interval training and cardio sessions."},
+    {i:"Target",t:"Personal Training",d:"One-on-one sessions with certified trainers for maximum results."},
+    {i:"Heart",t:"Nutrition Plans",d:"Custom diet plans designed by nutritionists for your body type."},
+    {i:"Zap",t:"CrossFit",d:"High-performance workouts combining gymnastics and weightlifting."},
+    {i:"Shield",t:"Recovery & Wellness",d:"Dedicated recovery including yoga, stretching, and massage."},
+  ];
+  return(
+    <div style={{background:"#000",color:"#fff"}}>
+      {/* HERO */}
+      <section style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",position:"relative",overflow:"hidden",paddingTop:64,background:cfg.heroBg?`url(${cfg.heroBg}) center/cover no-repeat`:"#000"}}>
+        <div style={{position:"absolute",inset:0,background:"linear-gradient(135deg,rgba(0,0,0,.93),rgba(0,0,0,.6))",zIndex:1}}/>
+        <div style={{position:"absolute",inset:0,background:`radial-gradient(ellipse at 20% 50%,${p}18,transparent 60%)`,zIndex:1}}/>
+        <div style={{position:"relative",zIndex:2,maxWidth:860,padding:"0 24px",textAlign:"center"}}>
+          <div style={{display:"inline-flex",alignItems:"center",gap:8,background:`${p}20`,border:`1px solid ${p}40`,borderRadius:100,padding:"6px 18px",marginBottom:24}}>
+            <Ic n="Flame" s={14} c={p}/><span style={{color:p,fontSize:13,fontWeight:700}}>{cfg.heroBadge}</span>
+          </div>
+          <h1 style={{fontSize:"clamp(48px,8vw,84px)",fontWeight:900,lineHeight:1.05,marginBottom:18,letterSpacing:"-2px"}}>
+            {cfg.heroTitle}<br/><span style={gt}>{cfg.heroHL}</span>
+          </h1>
+          <p style={{color:"#9ca3af",fontSize:18,lineHeight:1.65,maxWidth:620,margin:"0 auto 34px"}}>{cfg.heroSub}</p>
+          <div style={{display:"flex",gap:12,justifyContent:"center",flexWrap:"wrap",marginBottom:52}}>
+            <button onClick={()=>setPage("login")} style={{background:g,border:"none",color:"#fff",fontWeight:700,padding:"14px 28px",borderRadius:14,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",gap:8,boxShadow:`0 12px 40px ${p}40`}}>
+              <Ic n="Dumbbell" s={18} c="#fff"/>Member Login<Ic n="Arrow" s={16} c="#fff"/>
+            </button>
+            <a href="#plans" style={{background:"rgba(255,255,255,.1)",border:"1px solid rgba(255,255,255,.2)",color:"#fff",fontWeight:700,padding:"14px 28px",borderRadius:14,textDecoration:"none",fontSize:16,display:"flex",alignItems:"center",gap:8}}>
+              <Ic n="Play" s={16} c="#fff"/>View Plans
+            </a>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:24,maxWidth:580,margin:"0 auto"}}>
+            {[[cfg.s1v,cfg.s1l],[cfg.s2v,cfg.s2l],[cfg.s3v,cfg.s3l],[cfg.s4v,cfg.s4l]].map(([v,l])=>(
+              <div key={l}><div style={{fontSize:28,fontWeight:900,color:p}}>{v}</div><div style={{color:"#6b7280",fontSize:13,marginTop:2}}>{l}</div></div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* SERVICES */}
+      <section id="services" style={{padding:"80px 24px",background:"#09090b"}}>
+        <div style={{maxWidth:1100,margin:"0 auto"}}>
+          <div style={{textAlign:"center",marginBottom:52}}>
+            <div style={{display:"inline-flex",alignItems:"center",gap:8,background:`${p}20`,border:`1px solid ${p}40`,borderRadius:100,padding:"6px 18px",marginBottom:16}}>
+              <Ic n="Zap" s={14} c={p}/><span style={{color:p,fontSize:13,fontWeight:700}}>Our Services</span>
+            </div>
+            <h2 style={{fontSize:"clamp(32px,5vw,48px)",fontWeight:900}}>Everything You Need to <span style={gt}>Succeed</span></h2>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",gap:18}}>
+            {svcs.map(s=>(
+              <div key={s.t} style={{background:"#18181b",border:"1px solid rgba(255,255,255,.08)",borderRadius:20,padding:24,transition:"all .2s"}}
+                onMouseEnter={e=>{e.currentTarget.style.borderColor="rgba(255,255,255,.25)";e.currentTarget.style.transform="translateY(-3px)";}}
+                onMouseLeave={e=>{e.currentTarget.style.borderColor="rgba(255,255,255,.08)";e.currentTarget.style.transform="none";}}>
+                <div style={{width:48,height:48,borderRadius:14,background:g,display:"flex",alignItems:"center",justifyContent:"center",marginBottom:14}}><Ic n={s.i} s={22} c="#fff"/></div>
+                <h3 style={{color:"#fff",fontWeight:700,fontSize:17,marginBottom:8}}>{s.t}</h3>
+                <p style={{color:"#6b7280",fontSize:14,lineHeight:1.6}}>{s.d}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* GALLERY */}
+      {(cfg.gallery||[]).length>0&&(
+        <section style={{padding:"80px 24px",background:"#000"}}>
+          <div style={{maxWidth:1100,margin:"0 auto"}}>
+            <div style={{textAlign:"center",marginBottom:40}}>
+              <div style={{display:"inline-flex",alignItems:"center",gap:8,background:`${p}20`,border:`1px solid ${p}40`,borderRadius:100,padding:"6px 18px",marginBottom:14}}>
+                <Ic n="Heart" s={14} c={p}/><span style={{color:p,fontSize:13,fontWeight:700}}>Gallery</span>
+              </div>
+              <h2 style={{fontSize:"clamp(28px,4vw,42px)",fontWeight:900}}>Our <span style={gt}>Facility</span></h2>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:16}}>
+              {(cfg.gallery||[]).map((img,i)=>(
+                <div key={i} style={{borderRadius:18,overflow:"hidden",aspectRatio:"4/3"}}>
+                  <img src={img} alt={`Gallery ${i+1}`} style={{width:"100%",height:"100%",objectFit:"cover",transition:"transform .3s"}}
+                    onMouseEnter={e=>e.currentTarget.style.transform="scale(1.05)"}
+                    onMouseLeave={e=>e.currentTarget.style.transform="scale(1)"}/>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* PLANS */}
+      <section id="plans" style={{padding:"80px 24px",background:"#000"}}>
+        <div style={{maxWidth:1100,margin:"0 auto"}}>
+          <div style={{textAlign:"center",marginBottom:52}}>
+            <div style={{display:"inline-flex",alignItems:"center",gap:8,background:`${p}20`,border:`1px solid ${p}40`,borderRadius:100,padding:"6px 18px",marginBottom:16}}>
+              <Ic n="Flame" s={14} c={p}/><span style={{color:p,fontSize:13,fontWeight:700}}>Membership Plans</span>
+            </div>
+            <h2 style={{fontSize:"clamp(32px,5vw,48px)",fontWeight:900}}>Choose Your <span style={gt}>Plan</span></h2>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:24}}>
+            {plans.map(pl=>(
+              <div key={pl.id} style={{background:"#18181b",border:`2px solid ${pl.hl?p:"rgba(255,255,255,.1)"}`,borderRadius:24,padding:28,position:"relative",transition:"transform .2s"}}
+                onMouseEnter={e=>e.currentTarget.style.transform="scale(1.02)"}
+                onMouseLeave={e=>e.currentTarget.style.transform="scale(1)"}>
+                {pl.badge&&<div style={{position:"absolute",top:-13,left:"50%",transform:"translateX(-50%)",background:g,color:"#fff",fontSize:11,fontWeight:700,padding:"4px 14px",borderRadius:100,whiteSpace:"nowrap"}}>{pl.badge}</div>}
+                <h3 style={{color:"#fff",fontWeight:900,fontSize:22,marginBottom:4}}>{pl.name}</h3>
+                {pl.desc&&<p style={{color:"#6b7280",fontSize:13,marginBottom:14}}>{pl.desc}</p>}
+                <div style={{display:"flex",alignItems:"baseline",gap:4,marginBottom:20}}>
+                  <span style={{fontSize:36,fontWeight:900,color:p}}>₹{pl.price.toLocaleString("en-IN")}</span>
+                  <span style={{color:"#6b7280",fontSize:14}}>/month</span>
+                </div>
+                <div style={{marginBottom:22}}>{(pl.features||[]).map(f=>(
+                  <div key={f} style={{display:"flex",alignItems:"center",gap:8,marginBottom:9}}><Ic n="Check" s={15} c={p}/><span style={{color:"#d1d5db",fontSize:14}}>{f}</span></div>
+                ))}</div>
+                <button onClick={()=>setPage("login")} style={{width:"100%",background:pl.hl?g:"rgba(255,255,255,.08)",border:pl.hl?"none":"1px solid rgba(255,255,255,.2)",color:"#fff",fontWeight:700,padding:12,borderRadius:12,cursor:"pointer",fontSize:15}}>
+                  Get Started
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* CTA */}
+      <section style={{padding:"60px 24px",background:g}}>
+        <div style={{maxWidth:700,margin:"0 auto",textAlign:"center"}}>
+          <h2 style={{fontSize:"clamp(28px,5vw,42px)",fontWeight:900,color:"#fff",marginBottom:12}}>Ready to Transform?</h2>
+          <p style={{color:"rgba(255,255,255,.8)",fontSize:17,marginBottom:28}}>Join {cfg.s1v} members already on their fitness journey.</p>
+          <div style={{display:"flex",gap:12,justifyContent:"center",flexWrap:"wrap"}}>
+            <button onClick={()=>setPage("login")} style={{background:"#fff",border:"none",color:p,fontWeight:700,padding:"14px 28px",borderRadius:14,cursor:"pointer",fontSize:15}}>Login as Member</button>
+            <a href={"https://wa.me/"+cfg.wa} target="_blank" style={{background:"#22c55e",color:"#fff",fontWeight:700,padding:"14px 28px",borderRadius:14,textDecoration:"none",fontSize:15,display:"flex",alignItems:"center",gap:8}}>
+              <Ic n="Msg" s={18} c="#fff"/>WhatsApp Us
+            </a>
+          </div>
+        </div>
+      </section>
+
+      {/* CONTACT */}
+      <section id="contact" style={{padding:"80px 24px",background:"#000"}}>
+        <div style={{maxWidth:900,margin:"0 auto"}}>
+          <h2 style={{textAlign:"center",fontSize:"clamp(32px,5vw,48px)",fontWeight:900,marginBottom:44}}>Get In <span style={gt}>Touch</span></h2>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(240px,1fr))",gap:20}}>
+            {[{i:"Phone",t:"Call Us",v:cfg.phone,s:"Mon-Sat, 6am–10pm"},{i:"Mail",t:"Email Us",v:cfg.email,s:"Reply within 24 hours"},{i:"MapPin",t:"Visit Us",v:cfg.address,s:cfg.hours}].map(c=>(
+              <div key={c.t} style={{background:"#18181b",border:"1px solid rgba(255,255,255,.08)",borderRadius:20,padding:28,textAlign:"center"}}>
+                <div style={{width:56,height:56,borderRadius:16,background:g,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 16px"}}><Ic n={c.i} s={24} c="#fff"/></div>
+                <h3 style={{color:"#fff",fontWeight:700,fontSize:17,marginBottom:8}}>{c.t}</h3>
+                <p style={{color:p,fontWeight:600,fontSize:14,marginBottom:4}}>{c.v}</p>
+                <p style={{color:"#6b7280",fontSize:13}}>{c.s}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* FOOTER */}
+      <footer style={{background:"#09090b",borderTop:"1px solid rgba(255,255,255,.08)",padding:"28px 24px",textAlign:"center"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8,marginBottom:10}}>
+          <div style={{width:32,height:32,borderRadius:8,background:g,display:"flex",alignItems:"center",justifyContent:"center"}}><Ic n="Infinity" s={18} c="#fff"/></div>
+          <span style={{color:"#fff",fontWeight:900,fontSize:17}}>{cfg.logoText}<span style={{color:p}}>{cfg.logoAccent}</span></span>
+        </div>
+        <p style={{color:"#4b5563",fontSize:13}}>{cfg.footer}</p>
+      </footer>
+
+      <a href={"https://wa.me/"+cfg.wa} target="_blank" style={{position:"fixed",bottom:24,right:24,width:56,height:56,background:"#22c55e",borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",boxShadow:"0 8px 24px rgba(34,197,94,.45)",zIndex:50,textDecoration:"none"}}>
+        <Ic n="Msg" s={26} c="#fff"/>
+      </a>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+//  LOGIN PAGE
+// ══════════════════════════════════════════════════════════════
+function LoginPage({setPage,toast}){
+  const [id,setId]=useState("");
+  const [pw,setPw]=useState("");
+  const [showPw,setShowPw]=useState(false);
+  const [loading,setLoading]=useState(false);
+  const cfg=getCfg(),g=G(cfg),p=cfg.primary;
+
+  const doLogin=async e=>{
+    e.preventDefault();
+    if(!id.trim()||!pw.trim()){toast("Fill in all fields","error");return;}
+    setLoading(true);
+    try{
+      const members=await dbGetAll("igym_members");
+      const user=members.find(u=>u.member_id?.toLowerCase()===id.trim().toLowerCase()||u.email?.toLowerCase()===id.trim().toLowerCase());
+      if(!user){toast("Member not found","error");setLoading(false);return;}
+      if(user.role==="admin"){toast("Admin access is restricted","error");setLoading(false);return;}
+      const ok=await chkPw(pw,user.password_hash);
+      if(!ok){toast("Wrong password","error");setLoading(false);return;}
+      const tok=mkTok({id:user.id,member_id:user.member_id,name:user.name,role:user.role});
+      setSess(tok,{id:user.id,member_id:user.member_id,name:user.name,role:user.role});
+      toast("Welcome back, "+user.name.split(" ")[0]+"! 🎉","success");
+      setTimeout(()=>setPage("dashboard"),600);
+    }catch(err){toast("Login error: "+err.message,"error");}
+    setLoading(false);
+  };
+
+  return(
+    <div style={{minHeight:"100vh",background:"#000",display:"flex",alignItems:"center",justifyContent:"center",padding:"80px 16px 24px"}}>
+      <div style={{width:"100%",maxWidth:420}}>
+        <div style={{textAlign:"center",marginBottom:28}}>
+          <div style={{width:64,height:64,borderRadius:18,background:g,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 14px"}}><Ic n="Infinity" s={30} c="#fff"/></div>
+          <h1 style={{color:"#fff",fontWeight:900,fontSize:26,marginBottom:4}}>{cfg.logoText}<span style={{color:p}}>{cfg.logoAccent}</span></h1>
+          <p style={{color:"#6b7280",fontSize:14}}>Member Portal</p>
+        </div>
+        <div style={{background:"#18181b",border:"1px solid rgba(255,255,255,.1)",borderRadius:22,padding:26}}>
+          <form onSubmit={doLogin}>
+            <div style={{marginBottom:14}}><Field label="Member ID or Email" value={id} onChange={setId} placeholder="GYM001 or email@example.com"/></div>
+            <div style={{marginBottom:20,position:"relative"}}>
+              <Field label="Password" value={pw} onChange={setPw} type={showPw?"text":"password"} placeholder="Enter password"/>
+              <button type="button" onClick={()=>setShowPw(!showPw)} style={{position:"absolute",right:12,bottom:10,background:"none",border:"none",color:"#6b7280",cursor:"pointer",display:"flex"}}>
+                <Ic n={showPw?"EyeOff":"Eye"} s={17}/>
+              </button>
+            </div>
+            <button type="submit" disabled={loading} style={{width:"100%",background:g,border:"none",color:"#fff",fontWeight:700,padding:13,borderRadius:13,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+              {loading?<Spin s={20} c="#fff"/>:<><Ic n="Dumbbell" s={18} c="#fff"/>Login</>}
+            </button>
+          </form>
+          <div style={{marginTop:18,padding:14,background:"#09090b",borderRadius:12}}>
+            <p style={{color:"#6b7280",fontSize:12,fontWeight:700,marginBottom:6}}>Demo Credentials:</p>
+            <div style={{display:"grid",gridTemplateColumns:"auto 1fr",gap:"4px 10px",alignItems:"center"}}>
+              <span style={{color:"#60a5fa",fontSize:12,fontWeight:700}}>Member:</span><span style={{color:"#d1d5db",fontSize:12}}>GYM001 / member123</span>
+            </div>
+          </div>
+        </div>
+        <button onClick={()=>setPage("landing")} style={{display:"flex",alignItems:"center",gap:6,background:"none",border:"none",color:"#6b7280",cursor:"pointer",margin:"14px auto 0",fontSize:14}}>
+          <Ic n="ChevL" s={16}/>Back to Home
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+//  MEMBER DASHBOARD
+// ══════════════════════════════════════════════════════════════
+function MemberDash({setPage,toast}){
+  const user=getSess();
+  const cfg=getCfg(),g=G(cfg),p=cfg.primary;
+  const [tab,setTab]=useState("today");
+  const [date,setDate]=useState(today());
+  const [diet,setDiet]=useState(null);
+  const [workout,setWorkout]=useState(null);
+
+  useEffect(()=>{if(!user){setPage("login");return;}load();},[date]);
+  const load=async()=>{
+    try{
+      const diets=await dbGetWhere("igym_diet","member_id","==",user.id);
+      setDiet(diets.find(d=>d.date===date)||null);
+      const workouts=await dbGetWhere("igym_workout","member_id","==",user.id);
+      setWorkout(workouts.find(w=>w.date===date)||null);
+    }catch(e){console.warn("MemberDash load error",e);}
+  };
+
+  const mI={breakfast:"Coffee",lunch:"Sun",dinner:"Moon",snacks:"Apple"};
+  const mC={breakfast:"#eab308",lunch:p,dinner:"#60a5fa",snacks:"#4ade80"};
+
+  return(
+    <div style={{minHeight:"100vh",background:"#09090b",paddingTop:64}}>
+      <div style={{maxWidth:920,margin:"0 auto",padding:"24px 20px"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,flexWrap:"wrap",gap:10}}>
+          <div>
+            <h1 style={{color:"#fff",fontWeight:900,fontSize:22,marginBottom:4}}>Welcome, {user?.name?.split(" ")[0]}! 💪</h1>
+            <p style={{color:"#6b7280",fontSize:13}}>{user?.member_id} · {user?.role}</p>
+          </div>
+          <button onClick={()=>{clrSess();setPage("landing");}} style={{display:"flex",alignItems:"center",gap:6,background:"rgba(239,68,68,.1)",border:"1px solid rgba(239,68,68,.2)",color:"#f87171",padding:"8px 14px",borderRadius:10,cursor:"pointer",fontSize:13,fontWeight:600}}>
+            <Ic n="LogOut" s={15}/>Logout
+          </button>
+        </div>
+
+        <div style={{display:"flex",alignItems:"center",gap:4,background:"#18181b",border:"1px solid rgba(255,255,255,.1)",borderRadius:13,padding:"5px 12px",marginBottom:8,width:"fit-content"}}>
+          <button onClick={()=>setDate(addDays(date,-1))} style={{background:"none",border:"none",color:"#9ca3af",cursor:"pointer",display:"flex"}}><Ic n="ChevL" s={18}/></button>
+          <input type="date" value={date} onChange={e=>setDate(e.target.value)} style={{background:"none",border:"none",color:"#fff",fontSize:14,fontWeight:600,outline:"none",cursor:"pointer"}}/>
+          <button onClick={()=>setDate(addDays(date,1))} style={{background:"none",border:"none",color:"#9ca3af",cursor:"pointer",display:"flex"}}><Ic n="ChevR" s={18}/></button>
+        </div>
+        <p style={{color:"#6b7280",fontSize:13,marginBottom:20}}>{fmtDate(date)}</p>
+
+        <div style={{display:"flex",gap:8,marginBottom:22,flexWrap:"wrap"}}>
+          {[["today","📋 Today"],["diet","🥗 Diet"],["workout","💪 Workout"]].map(([t,l])=>(
+            <button key={t} onClick={()=>setTab(t)} style={{padding:"8px 16px",borderRadius:10,border:"none",fontWeight:600,fontSize:13,cursor:"pointer",background:tab===t?g:"rgba(255,255,255,.06)",color:tab===t?"#fff":"#9ca3af"}}>{l}</button>
+          ))}
+        </div>
+
+        {tab==="today"&&(
+          <div style={{display:"grid",gap:16}}>
+            {/* diet summary */}
+            <div style={{background:"#18181b",border:"1px solid rgba(255,255,255,.08)",borderRadius:20,padding:20}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
+                <h3 style={{color:"#fff",fontWeight:700,display:"flex",alignItems:"center",gap:8}}><Ic n="Utensils" s={18} c={p}/>Today's Diet</h3>
+                {diet?<span style={{color:"#4ade80",fontSize:12,background:"rgba(74,222,128,.12)",padding:"3px 10px",borderRadius:100}}>✓ Assigned</span>:<span style={{color:"#fb923c",fontSize:12,background:"rgba(251,146,60,.12)",padding:"3px 10px",borderRadius:100}}>Not assigned</span>}
+              </div>
+              {diet?(
+                <>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+                    {["breakfast","lunch","dinner","snacks"].map(m=>diet[m]&&(
+                      <div key={m} style={{background:"#09090b",borderRadius:14,padding:14}}>
+                        <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6}}><Ic n={mI[m]} s={14} c={mC[m]}/><span style={{color:"#9ca3af",fontSize:12,textTransform:"capitalize",fontWeight:600}}>{m}</span></div>
+                        <p style={{color:"#fff",fontSize:14,fontWeight:600,marginBottom:diet[m].cal?4:0}}>{diet[m].name}</p>
+                        {diet[m].cal>0&&<p style={{color:mC[m],fontSize:12}}>{diet[m].cal} kcal</p>}
+                      </div>
+                    ))}
+                  </div>
+                  {diet.total_cal>0&&<div style={{marginTop:12,padding:"10px 14px",background:p+"15",borderRadius:10,textAlign:"center"}}><span style={{color:p,fontWeight:700}}>Total: {diet.total_cal} kcal</span></div>}
+                </>
+              ):<p style={{color:"#4b5563",textAlign:"center",padding:"28px 0"}}>Your trainer hasn't assigned a diet plan for today yet.</p>}
+            </div>
+            {/* workout summary */}
+            <div style={{background:"#18181b",border:"1px solid rgba(255,255,255,.08)",borderRadius:20,padding:20}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
+                <h3 style={{color:"#fff",fontWeight:700,display:"flex",alignItems:"center",gap:8}}><Ic n="Dumbbell" s={18} c={p}/>Today's Workout</h3>
+                {workout?<span style={{color:"#4ade80",fontSize:12,background:"rgba(74,222,128,.12)",padding:"3px 10px",borderRadius:100}}>✓ Assigned</span>:<span style={{color:"#fb923c",fontSize:12,background:"rgba(251,146,60,.12)",padding:"3px 10px",borderRadius:100}}>Not assigned</span>}
+              </div>
+              {workout?(
+                <>
+                  <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
+                    {workout.type&&<span style={{background:p+"20",color:p,padding:"4px 14px",borderRadius:100,fontSize:13,fontWeight:600}}>{workout.type}</span>}
+                    {workout.duration&&<span style={{background:"rgba(255,255,255,.08)",color:"#d1d5db",padding:"4px 14px",borderRadius:100,fontSize:13}}>⏱ {workout.duration}</span>}
+                  </div>
+                  {(workout.exercises||[]).map((ex,i)=>(
+                    <div key={i} style={{background:"#09090b",borderRadius:12,padding:"11px 14px",display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
+                      <div><span style={{color:"#fff",fontWeight:600,fontSize:14}}>{ex.name}</span>{ex.muscle&&<span style={{color:"#6b7280",fontSize:12,marginLeft:8}}>{ex.muscle}</span>}</div>
+                      <div style={{display:"flex",alignItems:"center",gap:8}}>
+                        <span style={{color:p,fontSize:13,fontWeight:600}}>{ex.sets}×{ex.reps}{ex.weight?" · "+ex.weight:""}</span>
+                        {ex.link&&<a href={ex.link} target="_blank" style={{color:"#f87171",fontSize:12,textDecoration:"none"}}>▶</a>}
+                      </div>
+                    </div>
+                  ))}
+                </>
+              ):<p style={{color:"#4b5563",textAlign:"center",padding:"28px 0"}}>Your trainer hasn't assigned a workout plan for today yet.</p>}
+            </div>
+          </div>
+        )}
+
+        {tab==="diet"&&(
+          <div style={{background:"#18181b",border:"1px solid rgba(255,255,255,.08)",borderRadius:20,padding:20}}>
+            <h3 style={{color:"#fff",fontWeight:700,marginBottom:16}}>Diet Plan — {fmtDate(date)}</h3>
+            {diet?(
+              <>
+                {["breakfast","lunch","dinner","snacks"].map(m=>diet[m]&&(
+                  <div key={m} style={{background:"#09090b",borderRadius:16,padding:16,marginBottom:12}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+                      <Ic n={mI[m]} s={16} c={mC[m]}/><span style={{color:"#fff",fontWeight:700,textTransform:"capitalize"}}>{m}</span>
+                      {diet[m].cal>0&&<span style={{marginLeft:"auto",color:mC[m],fontWeight:700,fontSize:13}}>{diet[m].cal} kcal</span>}
+                    </div>
+                    <p style={{color:"#d1d5db",fontSize:15,fontWeight:600,marginBottom:8}}>{diet[m].name}</p>
+                    <div style={{display:"flex",gap:14,flexWrap:"wrap"}}>
+                      {diet[m].protein>0&&<span style={{color:"#60a5fa",fontSize:12,fontWeight:600}}>Protein: {diet[m].protein}g</span>}
+                      {diet[m].carbs>0&&<span style={{color:"#4ade80",fontSize:12,fontWeight:600}}>Carbs: {diet[m].carbs}g</span>}
+                      {diet[m].fat>0&&<span style={{color:"#fb923c",fontSize:12,fontWeight:600}}>Fat: {diet[m].fat}g</span>}
+                    </div>
+                    {diet[m].notes&&<p style={{color:"#6b7280",fontSize:13,marginTop:8,fontStyle:"italic"}}>{diet[m].notes}</p>}
+                  </div>
+                ))}
+                {diet.notes&&<div style={{padding:"12px 16px",background:p+"10",borderRadius:12,borderLeft:"3px solid "+p}}><p style={{color:"#d1d5db",fontSize:13}}>📋 {diet.notes}</p></div>}
+              </>
+            ):<p style={{color:"#4b5563",textAlign:"center",padding:"40px 0"}}>No diet plan for this date.</p>}
+          </div>
+        )}
+
+        {tab==="workout"&&(
+          <div style={{background:"#18181b",border:"1px solid rgba(255,255,255,.08)",borderRadius:20,padding:20}}>
+            <h3 style={{color:"#fff",fontWeight:700,marginBottom:16}}>Workout Plan — {fmtDate(date)}</h3>
+            {workout?(
+              <>
+                <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:16}}>
+                  {workout.type&&<span style={{background:p+"20",color:p,padding:"5px 14px",borderRadius:100,fontSize:13,fontWeight:600}}>{workout.type}</span>}
+                  {workout.duration&&<span style={{background:"rgba(255,255,255,.08)",color:"#d1d5db",padding:"5px 14px",borderRadius:100,fontSize:13}}>⏱ {workout.duration}</span>}
+                </div>
+                {(workout.exercises||[]).map((ex,i)=>(
+                  <div key={i} style={{background:"#09090b",borderRadius:14,padding:16,marginBottom:10,border:"1px solid rgba(255,255,255,.05)"}}>
+                    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
+                      <div style={{display:"flex",alignItems:"center",gap:10}}>
+                        <span style={{width:28,height:28,borderRadius:"50%",background:g,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:700,fontSize:13,flexShrink:0}}>{i+1}</span>
+                        <span style={{color:"#fff",fontWeight:700,fontSize:15}}>{ex.name}</span>
+                      </div>
+                      <span style={{color:p,fontWeight:700,fontSize:14}}>{ex.sets} × {ex.reps}</span>
+                    </div>
+                    <div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
+                      {ex.weight&&<span style={{color:"#9ca3af",fontSize:12}}>⚖️ {ex.weight}</span>}
+                      {ex.muscle&&<span style={{color:"#9ca3af",fontSize:12}}>💪 {ex.muscle}</span>}
+                      {ex.link&&<a href={ex.link} target="_blank" style={{color:"#f87171",fontSize:12,textDecoration:"none"}}>▶ Watch video</a>}
+                    </div>
+                    {ex.notes&&<p style={{color:"#6b7280",fontSize:12,marginTop:6,fontStyle:"italic"}}>{ex.notes}</p>}
+                  </div>
+                ))}
+                {workout.notes&&<div style={{padding:"12px 16px",background:p+"10",borderRadius:12,borderLeft:"3px solid "+p}}><p style={{color:"#d1d5db",fontSize:13}}>📋 {workout.notes}</p></div>}
+              </>
+            ):<p style={{color:"#4b5563",textAlign:"center",padding:"40px 0"}}>No workout plan for this date.</p>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+//  ADMIN DASHBOARD
+// ══════════════════════════════════════════════════════════════
+function AdminDash({setPage,toast}){
+  const user=getSess();
+  const cfg=getCfg(),g=G(cfg),p=cfg.primary;
+  const [tab,setTab]=useState("overview");
+  const [members,setMembers]=useState([]);
+  const [plans,setPlans]=useState([]);
+
+  useEffect(()=>{
+    if(!user||user.role!=="admin"){setPage("login");return;}
+    reload();
+  },[]);
+
+  const reload=async()=>{
+    try{
+      const all=await dbGetAll("igym_members");
+      setMembers(all.filter(u=>u.role!=="admin"));
+      setPlans(await dbGetAll("igym_plans"));
+    }catch(e){console.warn("AdminDash reload error",e);}
+  };
+
+  const navItems=[
+    {id:"overview",n:"Dashboard",i:"Dashboard"},
+    {id:"members",n:"Members",i:"Users"},
+    {id:"diet",n:"Diet Plans",i:"Utensils"},
+    {id:"workout",n:"Workout Plans",i:"Dumbbell"},
+    {id:"plans",n:"Membership Plans",i:"CreditCard"},
+  ];
+
+  return(
+    <div style={{minHeight:"100vh",background:"#09090b",display:"flex",paddingTop:64}}>
+      <aside style={{width:230,background:"#000",borderRight:"1px solid rgba(255,255,255,.08)",padding:"20px 12px",display:"flex",flexDirection:"column",position:"fixed",top:64,bottom:0,left:0,overflowY:"auto"}}>
+        <div style={{padding:"6px 8px 18px"}}>
+          <div style={{color:"#fff",fontWeight:900,fontSize:15}}>Admin Panel</div>
+          <div style={{color:"#6b7280",fontSize:12,marginTop:2}}>{user?.name}</div>
+        </div>
+        <nav style={{flex:1}}>
+          {navItems.map(n=>(
+            <button key={n.id} onClick={()=>setTab(n.id)}
+              style={{width:"100%",display:"flex",alignItems:"center",gap:10,padding:"10px 12px",borderRadius:12,border:"none",marginBottom:3,cursor:"pointer",background:tab===n.id?p+"20":"none",color:tab===n.id?p:"#9ca3af",fontWeight:tab===n.id?700:500,fontSize:14,textAlign:"left"}}>
+              <Ic n={n.i} s={18} c={tab===n.id?p:"#6b7280"}/>{n.n}
+            </button>
+          ))}
+        </nav>
+        <button onClick={()=>{clrSess();setPage("landing");}}
+          style={{display:"flex",alignItems:"center",gap:8,background:"rgba(239,68,68,.1)",border:"1px solid rgba(239,68,68,.2)",color:"#f87171",padding:"10px 14px",borderRadius:12,cursor:"pointer",fontSize:14,fontWeight:600}}>
+          <Ic n="LogOut" s={16}/>Logout
+        </button>
+      </aside>
+
+      <main style={{flex:1,marginLeft:230,padding:24,minHeight:"calc(100vh - 64px)",overflowY:"auto"}}>
+        {tab==="overview"&&<AdminOverview members={members} plans={plans} g={g} p={p}/>}
+        {tab==="members"&&<MembersTab members={members} plans={plans} g={g} p={p} toast={toast} reload={reload}/>}
+        {tab==="diet"&&<DietTab members={members} g={g} p={p} toast={toast}/>}
+        {tab==="workout"&&<WorkoutTab members={members} g={g} p={p} toast={toast}/>}
+        {tab==="plans"&&<PlansTab plans={plans} g={g} p={p} toast={toast} reload={reload}/>}
+      </main>
+    </div>
+  );
+}
+
+function AdminOverview({members,plans,g,p}){
+  const stats=[
+    {i:"Users",l:"Total Members",v:members.length,c:p},
+    {i:"Activity",l:"Active",v:members.filter(m=>m.status==="active").length,c:"#22c55e"},
+    {i:"CreditCard",l:"Plans",v:plans.length,c:"#8b5cf6"},
+    {i:"Award",l:"Est. Revenue",v:"₹"+(members.length*1999).toLocaleString("en-IN"),c:"#f59e0b"},
+  ];
+  return(
+    <div>
+      <h2 style={{color:"#fff",fontWeight:900,fontSize:22,marginBottom:20}}>Dashboard Overview</h2>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:16,marginBottom:24}}>
+        {stats.map(s=>(
+          <div key={s.l} style={{background:"#18181b",border:"1px solid rgba(255,255,255,.08)",borderRadius:18,padding:20}}>
+            <div style={{width:44,height:44,borderRadius:12,background:s.c+"20",display:"flex",alignItems:"center",justifyContent:"center",marginBottom:12}}><Ic n={s.i} s={22} c={s.c}/></div>
+            <div style={{color:"#fff",fontSize:28,fontWeight:900}}>{s.v}</div>
+            <div style={{color:"#6b7280",fontSize:13,marginTop:2}}>{s.l}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{background:"#18181b",border:"1px solid rgba(255,255,255,.08)",borderRadius:18,padding:20}}>
+        <h3 style={{color:"#fff",fontWeight:700,marginBottom:14}}>Recent Members</h3>
+        {members.length===0?<p style={{color:"#4b5563",textAlign:"center",padding:28}}>No members yet.</p>:
+          members.slice(0,6).map(m=>(
+            <div key={m.id} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 0",borderBottom:"1px solid rgba(255,255,255,.05)"}}>
+              <div style={{width:38,height:38,borderRadius:"50%",background:g,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:700,flexShrink:0}}>{m.name?.[0]}</div>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{color:"#fff",fontWeight:600,fontSize:14}}>{m.name}</div>
+                <div style={{color:"#6b7280",fontSize:12}}>{m.member_id} · {m.plan||"No Plan"}</div>
+              </div>
+              <span style={{fontSize:11,padding:"3px 9px",borderRadius:100,background:m.status==="active"?"rgba(34,197,94,.15)":"rgba(239,68,68,.15)",color:m.status==="active"?"#4ade80":"#f87171"}}>{m.status||"active"}</span>
+            </div>
+          ))
+        }
+      </div>
+    </div>
+  );
+}
+
+function MembersTab({members,plans,g,p,toast,reload}){
+  const [q,setQ]=useState("");
+  const [modal,setModal]=useState(false);
+  const [editing,setEditing]=useState(null);
+  const [view,setView]=useState(null);
+  const [fm,setFm]=useState({});
+  const [saving,setSaving]=useState(false);
+  const up=v=>setFm(f=>({...f,...v}));
+  const list=members.filter(m=>m.name?.toLowerCase().includes(q.toLowerCase())||m.member_id?.toLowerCase().includes(q.toLowerCase())||m.email?.toLowerCase().includes(q.toLowerCase()));
+
+  const openCreate=()=>{setEditing(null);setFm({status:"active"});setModal(true);};
+  const openEdit=m=>{setEditing(m);setFm({...m,password:""});setModal(true);};
+  const doDelete=async(id,name)=>{
+    if(!confirm("Delete "+name+"?"))return;
+    try{await dbDelete("igym_members",id);toast("Member deleted","success");reload();}
+    catch(e){toast("Delete failed: "+e.message,"error");}
+  };
+  const doSave=async e=>{
+    e.preventDefault();
+    if(!fm.name?.trim()||!fm.email?.trim()){toast("Name & email required","error");return;}
+    if(!editing&&!fm.password?.trim()){toast("Password required","error");return;}
+    setSaving(true);
+    try{
+      if(editing){
+        const upd={name:fm.name,email:fm.email,phone:fm.phone||"",age:fm.age||"",weight:fm.weight||"",height:fm.height||"",goal:fm.goal||"",plan:fm.plan||"",status:fm.status};
+        if(fm.password)upd.password_hash=await hashPw(fm.password);
+        await dbSet("igym_members",editing.id,upd);
+        toast("Member updated!","success");
+      }else{
+        const all=await dbGetAll("igym_members");
+        const na=all.filter(u=>u.role!=="admin");
+        const mid="GYM"+String(na.length+1).padStart(3,"0");
+        const newId="m"+Date.now();
+        await dbSet("igym_members",newId,{member_id:mid,name:fm.name,email:fm.email,phone:fm.phone||"",age:fm.age||"",weight:fm.weight||"",height:fm.height||"",goal:fm.goal||"",plan:fm.plan||"",status:fm.status||"active",role:"member",password_hash:await hashPw(fm.password)});
+        toast("Member created! ID: "+mid,"success");
+      }
+      setModal(false);reload();
+    }catch(err){toast("Save failed: "+err.message,"error");}
+    setSaving(false);
+  };
+
+  return(
+    <div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:10}}>
+        <div>
+          <h2 style={{color:"#fff",fontWeight:900,fontSize:22}}>Members</h2>
+          <p style={{color:"#6b7280",fontSize:13,marginTop:3}}>{list.length} member{list.length!==1?"s":""}</p>
+        </div>
+        <button onClick={openCreate} style={{background:g,border:"none",color:"#fff",fontWeight:700,padding:"10px 18px",borderRadius:12,cursor:"pointer",fontSize:14,display:"flex",alignItems:"center",gap:6}}>
+          <Ic n="Plus" s={16} c="#fff"/>Add Member
+        </button>
+      </div>
+      <div style={{position:"relative",marginBottom:14}}>
+        <div style={{position:"absolute",left:13,top:"50%",transform:"translateY(-50%)"}}><Ic n="Search" s={16} c="#6b7280"/></div>
+        <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search by name, ID or email…"
+          style={{width:"100%",background:"#18181b",border:"1px solid rgba(255,255,255,.1)",borderRadius:12,padding:"10px 14px 10px 40px",color:"#fff",fontSize:14,outline:"none"}}/>
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+        {list.length===0?(
+          <div style={{textAlign:"center",padding:52,background:"#18181b",borderRadius:18}}>
+            <Ic n="Users" s={44} c="#374151"/>
+            <p style={{color:"#4b5563",marginTop:14}}>No members found.</p>
+          </div>
+        ):list.map(m=>(
+          <div key={m.id} style={{background:"#18181b",border:"1px solid rgba(255,255,255,.08)",borderRadius:16,padding:16,display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+            <div style={{width:44,height:44,borderRadius:"50%",background:g,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:700,fontSize:16,flexShrink:0}}>{m.name?.[0]}</div>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:3}}>
+                <span style={{color:"#fff",fontWeight:700,fontSize:15}}>{m.name}</span>
+                <span style={{background:p+"20",color:p,fontSize:11,padding:"2px 8px",borderRadius:100,fontWeight:700}}>{m.member_id}</span>
+                <span style={{background:m.status==="active"?"rgba(34,197,94,.15)":"rgba(239,68,68,.15)",color:m.status==="active"?"#4ade80":"#f87171",fontSize:11,padding:"2px 8px",borderRadius:100}}>{m.status||"active"}</span>
+              </div>
+              <div style={{color:"#6b7280",fontSize:13}}>{m.email}{m.plan?" · "+m.plan+" Plan":""}</div>
+            </div>
+            <div style={{display:"flex",gap:6,flexShrink:0}}>
+              <button onClick={()=>setView(m)} style={{padding:"7px 8px",background:"rgba(96,165,250,.1)",border:"1px solid rgba(96,165,250,.2)",color:"#60a5fa",borderRadius:8,cursor:"pointer",display:"flex"}}><Ic n="Eye" s={14}/></button>
+              <button onClick={()=>openEdit(m)} style={{padding:"7px 8px",background:p+"15",border:"1px solid "+p+"30",color:p,borderRadius:8,cursor:"pointer",display:"flex"}}><Ic n="Edit" s={14}/></button>
+              <button onClick={()=>doDelete(m.id,m.name)} style={{padding:"7px 8px",background:"rgba(239,68,68,.1)",border:"1px solid rgba(239,68,68,.2)",color:"#f87171",borderRadius:8,cursor:"pointer",display:"flex"}}><Ic n="Trash" s={14}/></button>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {modal&&(
+        <Modal title={editing?"Edit — "+editing.name:"Add New Member"} onClose={()=>setModal(false)} wide>
+          <form onSubmit={doSave}>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
+              <Field label="Full Name *" value={fm.name||""} onChange={v=>up({name:v})} placeholder="Rahul Sharma"/>
+              <Field label="Email *" value={fm.email||""} onChange={v=>up({email:v})} placeholder="rahul@example.com"/>
+              <Field label={editing?"New Password (blank=keep)":"Password *"} value={fm.password||""} onChange={v=>up({password:v})} type="password" placeholder="Min 6 chars"/>
+              <Field label="Phone" value={fm.phone||""} onChange={v=>up({phone:v})} placeholder="+91 98765 43210"/>
+              <Field label="Age" value={fm.age?.toString()||""} onChange={v=>up({age:parseInt(v)||""})} type="number" placeholder="25"/>
+              <Field label="Weight (kg)" value={fm.weight?.toString()||""} onChange={v=>up({weight:v})} type="number" placeholder="70"/>
+              <Field label="Height (cm)" value={fm.height?.toString()||""} onChange={v=>up({height:v})} type="number" placeholder="175"/>
+              <div>
+                <label style={{display:"block",color:"#d1d5db",fontSize:13,fontWeight:600,marginBottom:5}}>Fitness Goal</label>
+                <select value={fm.goal||""} onChange={e=>up({goal:e.target.value})} style={{width:"100%",background:"#27272a",border:"1px solid rgba(255,255,255,.12)",borderRadius:10,padding:"9px 13px",color:"#fff",fontSize:14,outline:"none"}}>
+                  <option value="">Select goal</option>
+                  {["Weight Loss","Muscle Gain","Endurance","General Fitness","Flexibility","Athletic Performance"].map(g=><option key={g}>{g}</option>)}
+                </select>
+              </div>
+              <div>
+                <label style={{display:"block",color:"#d1d5db",fontSize:13,fontWeight:600,marginBottom:5}}>Membership Plan</label>
+                <select value={fm.plan||""} onChange={e=>up({plan:e.target.value})} style={{width:"100%",background:"#27272a",border:"1px solid rgba(255,255,255,.12)",borderRadius:10,padding:"9px 13px",color:"#fff",fontSize:14,outline:"none"}}>
+                  <option value="">No Plan</option>
+                  {plans.map(pl=><option key={pl.id} value={pl.name}>{pl.name} — ₹{pl.price}</option>)}
+                </select>
+              </div>
+              <div>
+                <label style={{display:"block",color:"#d1d5db",fontSize:13,fontWeight:600,marginBottom:5}}>Status</label>
+                <select value={fm.status||"active"} onChange={e=>up({status:e.target.value})} style={{width:"100%",background:"#27272a",border:"1px solid rgba(255,255,255,.12)",borderRadius:10,padding:"9px 13px",color:"#fff",fontSize:14,outline:"none"}}>
+                  <option value="active">Active</option><option value="inactive">Inactive</option>
+                </select>
+              </div>
+            </div>
+            <div style={{display:"flex",gap:10}}>
+              <button type="button" onClick={()=>setModal(false)} style={{flex:1,padding:12,background:"#27272a",border:"none",color:"#d1d5db",borderRadius:12,cursor:"pointer",fontWeight:600}}>Cancel</button>
+              <button type="submit" disabled={saving} style={{flex:1,padding:12,background:g,border:"none",color:"#fff",borderRadius:12,cursor:"pointer",fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+                {saving?<Spin s={18} c="#fff"/>:<><Ic n="Save" s={16} c="#fff"/>{editing?"Update":"Create Member"}</>}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {view&&(
+        <Modal title="Member Details" onClose={()=>setView(null)}>
+          <div style={{textAlign:"center",marginBottom:18}}>
+            <div style={{width:70,height:70,borderRadius:"50%",background:g,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:900,fontSize:28,margin:"0 auto 10px"}}>{view.name?.[0]}</div>
+            <h3 style={{color:"#fff",fontWeight:800,fontSize:20}}>{view.name}</h3>
+            <p style={{color:p,fontSize:14,fontWeight:700,fontFamily:"monospace"}}>{view.member_id}</p>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            {[["Email",view.email],["Phone",view.phone||"N/A"],["Age",view.age?view.age+" yrs":"N/A"],["Weight",view.weight?view.weight+" kg":"N/A"],["Height",view.height?view.height+" cm":"N/A"],["Goal",view.goal||"N/A"],["Plan",view.plan||"N/A"],["Status",view.status||"active"]].map(([l,v])=>(
+              <div key={l} style={{background:"#27272a",borderRadius:12,padding:12}}>
+                <div style={{color:"#6b7280",fontSize:11,marginBottom:4}}>{l}</div>
+                <div style={{color:"#fff",fontSize:13,fontWeight:600,wordBreak:"break-all"}}>{v}</div>
+              </div>
+            ))}
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function DietTab({members,g,p,toast}){
+  const [mid,setMid]=useState("");
+  const [date,setDate]=useState(today());
+  const [plan,setPlan]=useState(emptyD());
+  const [saving,setSaving]=useState(false);
+  const [has,setHas]=useState(false);
+
+  function emptyD(){
+    return{breakfast:{name:"",cal:0,protein:0,carbs:0,fat:0,notes:""},lunch:{name:"",cal:0,protein:0,carbs:0,fat:0,notes:""},dinner:{name:"",cal:0,protein:0,carbs:0,fat:0,notes:""},snacks:{name:"",cal:0,protein:0,carbs:0,fat:0,notes:""},notes:""};
+  }
+
+  useEffect(()=>{
+    if(!mid)return;
+    (async()=>{
+      try{
+        const recs=await dbGetWhere("igym_diet","member_id","==",mid);
+        const f=recs.find(d=>d.date===date);
+        if(f){setPlan(f);setHas(true);}else{setPlan(emptyD());setHas(false);}
+      }catch(e){console.warn(e);setPlan(emptyD());setHas(false);}
+    })();
+  },[mid,date]);
+
+  const upM=(m,f,v)=>setPlan(prev=>({...prev,[m]:{...prev[m],[f]:v}}));
+  const tc=["breakfast","lunch","dinner","snacks"].reduce((s,m)=>s+(parseInt(plan[m]?.cal)||0),0);
+  const mem=members.find(m=>m.id===mid);
+
+  const doSave=async()=>{
+    if(!mid){toast("Select a member","error");return;}
+    setSaving(true);
+    try{
+      const recs=await dbGetWhere("igym_diet","member_id","==",mid);
+      const existing=recs.find(d=>d.date===date);
+      const docId=existing?.id||"dp"+Date.now();
+      await dbSet("igym_diet",docId,{...plan,member_id:mid,date,total_cal:tc});
+      toast("Diet plan "+(has?"updated":"created")+" for "+mem?.name+"!","success");
+      setHas(true);
+    }catch(err){toast("Save failed: "+err.message,"error");}
+    setSaving(false);
+  };
+
+  const meals=[{k:"breakfast",l:"Breakfast",n:"Coffee",c:"#eab308"},{k:"lunch",l:"Lunch",n:"Sun",c:p},{k:"dinner",l:"Dinner",n:"Moon",c:"#60a5fa"},{k:"snacks",l:"Snacks",n:"Apple",c:"#4ade80"}];
+
+  return(
+    <div>
+      <h2 style={{color:"#fff",fontWeight:900,fontSize:22,marginBottom:4}}>Diet Plans</h2>
+      <p style={{color:"#6b7280",fontSize:13,marginBottom:20}}>Assign daily meal plans to members</p>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:18}}>
+        <div>
+          <label style={{color:"#d1d5db",fontSize:13,fontWeight:600,display:"block",marginBottom:6}}>👤 Select Member *</label>
+          <select value={mid} onChange={e=>setMid(e.target.value)} style={{width:"100%",background:"#18181b",border:"1px solid rgba(255,255,255,.12)",borderRadius:12,padding:"10px 13px",color:"#fff",fontSize:14,outline:"none"}}>
+            <option value="">— Choose a member —</option>
+            {members.map(m=><option key={m.id} value={m.id}>{m.name} ({m.member_id})</option>)}
+          </select>
+        </div>
+        <div>
+          <label style={{color:"#d1d5db",fontSize:13,fontWeight:600,display:"block",marginBottom:6}}>📅 Select Date *</label>
+          <div style={{display:"flex",alignItems:"center",gap:4,background:"#18181b",border:"1px solid rgba(255,255,255,.12)",borderRadius:12,padding:"3px 10px"}}>
+            <button onClick={()=>setDate(addDays(date,-1))} style={{background:"none",border:"none",color:"#9ca3af",cursor:"pointer",display:"flex"}}><Ic n="ChevL" s={18}/></button>
+            <input type="date" value={date} onChange={e=>setDate(e.target.value)} style={{flex:1,background:"none",border:"none",color:"#fff",fontSize:14,outline:"none",padding:"7px 4px"}}/>
+            <button onClick={()=>setDate(addDays(date,1))} style={{background:"none",border:"none",color:"#9ca3af",cursor:"pointer",display:"flex"}}><Ic n="ChevR" s={18}/></button>
+          </div>
+        </div>
+      </div>
+      {!mid?(
+        <div style={{textAlign:"center",padding:52,background:"#18181b",borderRadius:20,border:"2px dashed rgba(255,255,255,.1)"}}>
+          <Ic n="Utensils" s={44} c="#374151"/>
+          <p style={{color:"#4b5563",marginTop:12}}>Select a member to assign their diet plan</p>
+        </div>
+      ):(
+        <>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",background:"#18181b",border:"1px solid rgba(255,255,255,.08)",borderRadius:16,padding:"12px 18px",marginBottom:14,flexWrap:"wrap",gap:10}}>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <div style={{width:40,height:40,borderRadius:"50%",background:g,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:700,flexShrink:0}}>{mem?.name?.[0]}</div>
+              <div>
+                <div style={{color:"#fff",fontWeight:700}}>{mem?.name}</div>
+                <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                  <span style={{color:p,fontSize:12,fontFamily:"monospace"}}>{mem?.member_id}</span>
+                  {has?<span style={{color:"#4ade80",fontSize:11}}>✓ Plan exists</span>:<span style={{color:"#fb923c",fontSize:11}}>⚠ No plan yet</span>}
+                </div>
+              </div>
+            </div>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              {tc>0&&<div style={{padding:"5px 12px",background:p+"15",borderRadius:10,textAlign:"center"}}><div style={{color:"#6b7280",fontSize:10}}>Total</div><div style={{color:p,fontWeight:700,fontSize:14}}>{tc} kcal</div></div>}
+              <button onClick={doSave} disabled={saving} style={{background:g,border:"none",color:"#fff",fontWeight:700,padding:"9px 18px",borderRadius:12,cursor:"pointer",fontSize:14,display:"flex",alignItems:"center",gap:6}}>
+                {saving?<Spin s={16} c="#fff"/>:<><Ic n="Save" s={16} c="#fff"/>Save</>}
+              </button>
+            </div>
+          </div>
+
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:12,marginBottom:12}}>
+            {meals.map(({k,l,n,c})=>(
+              <div key={k} style={{background:c+"10",border:"1px solid "+c+"22",borderRadius:18,padding:16}}>
+                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+                  <div style={{width:32,height:32,background:"rgba(0,0,0,.3)",borderRadius:9,display:"flex",alignItems:"center",justifyContent:"center"}}><Ic n={n} s={15} c={c}/></div>
+                  <span style={{color:"#fff",fontWeight:700}}>{l}</span>
+                  {plan[k]?.cal>0&&<span style={{marginLeft:"auto",color:c,fontSize:12,fontWeight:700}}>{plan[k].cal} kcal</span>}
+                </div>
+                <input value={plan[k]?.name||""} onChange={e=>upM(k,"name",e.target.value)}
+                  placeholder={"e.g. "+(k==="breakfast"?"Oats with Banana":k==="lunch"?"Grilled Chicken & Rice":k==="dinner"?"Paneer Tikka & Roti":"Greek Yogurt")}
+                  style={{width:"100%",background:"rgba(0,0,0,.3)",border:"1px solid rgba(255,255,255,.1)",borderRadius:10,padding:"8px 12px",color:"#fff",fontSize:14,outline:"none",marginBottom:8}}/>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:6,marginBottom:8}}>
+                  {[["cal","Kcal"],["protein","Protein"],["carbs","Carbs"],["fat","Fat"]].map(([f,lb])=>(
+                    <div key={f}>
+                      <div style={{color:"#6b7280",fontSize:10,marginBottom:3}}>{lb}</div>
+                      <input type="number" min="0" value={plan[k]?.[f]||""} onChange={e=>upM(k,f,parseInt(e.target.value)||0)} placeholder="0"
+                        style={{width:"100%",background:"rgba(0,0,0,.3)",border:"1px solid rgba(255,255,255,.1)",borderRadius:8,padding:"6px 7px",color:"#fff",fontSize:12,outline:"none"}}/>
+                    </div>
+                  ))}
+                </div>
+                <input value={plan[k]?.notes||""} onChange={e=>upM(k,"notes",e.target.value)} placeholder="Notes / instructions…"
+                  style={{width:"100%",background:"rgba(0,0,0,.3)",border:"1px solid rgba(255,255,255,.1)",borderRadius:10,padding:"8px 12px",color:"#fff",fontSize:13,outline:"none"}}/>
+              </div>
+            ))}
+          </div>
+
+          <div style={{background:"#18181b",border:"1px solid rgba(255,255,255,.08)",borderRadius:14,padding:16,marginBottom:14}}>
+            <label style={{color:"#d1d5db",fontSize:13,fontWeight:600,display:"block",marginBottom:6}}>📋 General Notes</label>
+            <textarea value={plan.notes||""} onChange={e=>setPlan(prev=>({...prev,notes:e.target.value}))} rows={3} placeholder="e.g. Drink 3-4 liters of water today…"
+              style={{width:"100%",background:"#27272a",border:"1px solid rgba(255,255,255,.1)",borderRadius:12,padding:"10px 13px",color:"#fff",fontSize:14,outline:"none",resize:"none"}}/>
+          </div>
+          <div style={{display:"flex",justifyContent:"flex-end"}}>
+            <button onClick={doSave} disabled={saving} style={{background:g,border:"none",color:"#fff",fontWeight:700,padding:"11px 26px",borderRadius:12,cursor:"pointer",fontSize:15,display:"flex",alignItems:"center",gap:8}}>
+              {saving?<Spin s={18} c="#fff"/>:<><Ic n="Save" s={18} c="#fff"/>Save Diet Plan for {mem?.name}</>}
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function WorkoutTab({members,g,p,toast}){
+  const [mid,setMid]=useState("");
+  const [date,setDate]=useState(today());
+  const [wtype,setWtype]=useState("");
+  const [dur,setDur]=useState("");
+  const [notes,setNotes]=useState("");
+  const [exs,setExs]=useState([dEx()]);
+  const [saving,setSaving]=useState(false);
+  const [has,setHas]=useState(false);
+
+  function dEx(){return{name:"",sets:3,reps:10,weight:"",muscle:"",link:"",notes:""};}
+
+  useEffect(()=>{
+    if(!mid)return;
+    (async()=>{
+      try{
+        const recs=await dbGetWhere("igym_workout","member_id","==",mid);
+        const f=recs.find(w=>w.date===date);
+        if(f){setWtype(f.type||"");setDur(f.duration||"");setNotes(f.notes||"");setExs(f.exercises?.length?f.exercises:[dEx()]);setHas(true);}
+        else{setWtype("");setDur("");setNotes("");setExs([dEx()]);setHas(false);}
+      }catch(e){console.warn(e);setWtype("");setDur("");setNotes("");setExs([dEx()]);setHas(false);}
+    })();
+  },[mid,date]);
+
+  const upEx=(i,f,v)=>setExs(prev=>prev.map((e,idx)=>idx===i?{...e,[f]:v}:e));
+  const mem=members.find(m=>m.id===mid);
+
+  const doSave=async()=>{
+    if(!mid){toast("Select a member","error");return;}
+    const valid=exs.filter(e=>e.name.trim());
+    if(!valid.length){toast("Add at least one exercise","error");return;}
+    setSaving(true);
+    try{
+      const recs=await dbGetWhere("igym_workout","member_id","==",mid);
+      const existing=recs.find(w=>w.date===date);
+      const docId=existing?.id||"wp"+Date.now();
+      await dbSet("igym_workout",docId,{member_id:mid,date,type:wtype,duration:dur,notes,exercises:valid});
+      toast("Workout plan "+(has?"updated":"created")+" for "+mem?.name+"!","success");
+      setHas(true);
+    }catch(err){toast("Save failed: "+err.message,"error");}
+    setSaving(false);
+  };
+
+  const wtypes=["Upper Body","Lower Body","Full Body","Cardio","HIIT","Core & Abs","CrossFit","Strength","Flexibility","Rest Day"];
+  const muscles=["Chest","Back","Shoulders","Biceps","Triceps","Legs","Quads","Hamstrings","Glutes","Calves","Core","Full Body"];
+
+  return(
+    <div>
+      <h2 style={{color:"#fff",fontWeight:900,fontSize:22,marginBottom:4}}>Workout Plans</h2>
+      <p style={{color:"#6b7280",fontSize:13,marginBottom:20}}>Assign daily exercise plans to members</p>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:18}}>
+        <div>
+          <label style={{color:"#d1d5db",fontSize:13,fontWeight:600,display:"block",marginBottom:6}}>👤 Select Member *</label>
+          <select value={mid} onChange={e=>setMid(e.target.value)} style={{width:"100%",background:"#18181b",border:"1px solid rgba(255,255,255,.12)",borderRadius:12,padding:"10px 13px",color:"#fff",fontSize:14,outline:"none"}}>
+            <option value="">— Choose a member —</option>
+            {members.map(m=><option key={m.id} value={m.id}>{m.name} ({m.member_id})</option>)}
+          </select>
+        </div>
+        <div>
+          <label style={{color:"#d1d5db",fontSize:13,fontWeight:600,display:"block",marginBottom:6}}>📅 Select Date *</label>
+          <div style={{display:"flex",alignItems:"center",gap:4,background:"#18181b",border:"1px solid rgba(255,255,255,.12)",borderRadius:12,padding:"3px 10px"}}>
+            <button onClick={()=>setDate(addDays(date,-1))} style={{background:"none",border:"none",color:"#9ca3af",cursor:"pointer",display:"flex"}}><Ic n="ChevL" s={18}/></button>
+            <input type="date" value={date} onChange={e=>setDate(e.target.value)} style={{flex:1,background:"none",border:"none",color:"#fff",fontSize:14,outline:"none",padding:"7px 4px"}}/>
+            <button onClick={()=>setDate(addDays(date,1))} style={{background:"none",border:"none",color:"#9ca3af",cursor:"pointer",display:"flex"}}><Ic n="ChevR" s={18}/></button>
+          </div>
+        </div>
+      </div>
+      {!mid?(
+        <div style={{textAlign:"center",padding:52,background:"#18181b",borderRadius:20,border:"2px dashed rgba(255,255,255,.1)"}}>
+          <Ic n="Dumbbell" s={44} c="#374151"/>
+          <p style={{color:"#4b5563",marginTop:12}}>Select a member to assign their workout plan</p>
+        </div>
+      ):(
+        <>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",background:"#18181b",border:"1px solid rgba(255,255,255,.08)",borderRadius:16,padding:"12px 18px",marginBottom:14,flexWrap:"wrap",gap:10}}>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <div style={{width:40,height:40,borderRadius:"50%",background:g,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:700,flexShrink:0}}>{mem?.name?.[0]}</div>
+              <div>
+                <div style={{color:"#fff",fontWeight:700}}>{mem?.name}</div>
+                <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                  <span style={{color:p,fontSize:12,fontFamily:"monospace"}}>{mem?.member_id}</span>
+                  {has?<span style={{color:"#4ade80",fontSize:11}}>✓ Plan exists</span>:<span style={{color:"#fb923c",fontSize:11}}>⚠ No plan yet</span>}
+                </div>
+              </div>
+            </div>
+            <button onClick={doSave} disabled={saving} style={{background:g,border:"none",color:"#fff",fontWeight:700,padding:"9px 18px",borderRadius:12,cursor:"pointer",fontSize:14,display:"flex",alignItems:"center",gap:6}}>
+              {saving?<Spin s={16} c="#fff"/>:<><Ic n="Save" s={16} c="#fff"/>Save</>}
+            </button>
+          </div>
+
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:14}}>
+            <div>
+              <label style={{color:"#d1d5db",fontSize:13,fontWeight:600,display:"block",marginBottom:6}}>🏋️ Workout Type</label>
+              <select value={wtype} onChange={e=>setWtype(e.target.value)} style={{width:"100%",background:"#18181b",border:"1px solid rgba(255,255,255,.12)",borderRadius:12,padding:"10px 13px",color:"#fff",fontSize:14,outline:"none"}}>
+                <option value="">— Select type —</option>
+                {wtypes.map(t=><option key={t}>{t}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={{color:"#d1d5db",fontSize:13,fontWeight:600,display:"block",marginBottom:6}}>⏱ Duration</label>
+              <input value={dur} onChange={e=>setDur(e.target.value)} placeholder="e.g. 60 mins"
+                style={{width:"100%",background:"#18181b",border:"1px solid rgba(255,255,255,.12)",borderRadius:12,padding:"10px 13px",color:"#fff",fontSize:14,outline:"none"}}/>
+            </div>
+          </div>
+
+          <div style={{background:"#18181b",border:"1px solid rgba(255,255,255,.08)",borderRadius:18,marginBottom:14}}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 18px",borderBottom:"1px solid rgba(255,255,255,.08)"}}>
+              <span style={{color:"#fff",fontWeight:700,display:"flex",alignItems:"center",gap:8}}><Ic n="Dumbbell" s={18} c={p}/>Exercises</span>
+              <button onClick={()=>setExs(prev=>[...prev,dEx()])} style={{background:p+"20",border:"none",color:p,fontWeight:600,padding:"6px 12px",borderRadius:8,cursor:"pointer",fontSize:13,display:"flex",alignItems:"center",gap:4}}>
+                <Ic n="Plus" s={14} c={p}/>Add
+              </button>
+            </div>
+            <div style={{padding:14,display:"flex",flexDirection:"column",gap:10}}>
+              {exs.map((ex,i)=>(
+                <div key={i} style={{background:"#27272a",border:"1px solid rgba(255,255,255,.06)",borderRadius:14,padding:14}}>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8}}>
+                      <span style={{width:26,height:26,borderRadius:"50%",background:g,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:700,fontSize:12,flexShrink:0}}>{i+1}</span>
+                      <span style={{color:"#fff",fontWeight:600,fontSize:14}}>{ex.name||"Exercise "+(i+1)}</span>
+                    </div>
+                    {exs.length>1&&<button onClick={()=>setExs(prev=>prev.filter((_,idx)=>idx!==i))} style={{background:"none",border:"none",color:"#f87171",cursor:"pointer",display:"flex"}}><Ic n="X" s={15}/></button>}
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
+                    <div style={{gridColumn:"1/-1"}}>
+                      <input value={ex.name} onChange={e=>upEx(i,"name",e.target.value)} placeholder="Exercise name (e.g. Bench Press)"
+                        style={{width:"100%",background:"#18181b",border:"1px solid rgba(255,255,255,.1)",borderRadius:10,padding:"8px 12px",color:"#fff",fontSize:14,outline:"none"}}/>
+                    </div>
+                    <div><div style={{color:"#6b7280",fontSize:11,marginBottom:3}}>Sets</div><input type="number" min="1" value={ex.sets} onChange={e=>upEx(i,"sets",parseInt(e.target.value)||1)} style={{width:"100%",background:"#18181b",border:"1px solid rgba(255,255,255,.1)",borderRadius:9,padding:"7px 9px",color:"#fff",fontSize:14,outline:"none"}}/></div>
+                    <div><div style={{color:"#6b7280",fontSize:11,marginBottom:3}}>Reps</div><input type="number" min="1" value={ex.reps} onChange={e=>upEx(i,"reps",parseInt(e.target.value)||1)} style={{width:"100%",background:"#18181b",border:"1px solid rgba(255,255,255,.1)",borderRadius:9,padding:"7px 9px",color:"#fff",fontSize:14,outline:"none"}}/></div>
+                    <div><div style={{color:"#6b7280",fontSize:11,marginBottom:3}}>Weight</div><input value={ex.weight||""} onChange={e=>upEx(i,"weight",e.target.value)} placeholder="e.g. 60kg" style={{width:"100%",background:"#18181b",border:"1px solid rgba(255,255,255,.1)",borderRadius:9,padding:"7px 9px",color:"#fff",fontSize:14,outline:"none"}}/></div>
+                    <div><div style={{color:"#6b7280",fontSize:11,marginBottom:3}}>Muscle Group</div>
+                      <select value={ex.muscle||""} onChange={e=>upEx(i,"muscle",e.target.value)} style={{width:"100%",background:"#18181b",border:"1px solid rgba(255,255,255,.1)",borderRadius:9,padding:"7px 9px",color:"#fff",fontSize:13,outline:"none"}}>
+                        <option value="">Select</option>{muscles.map(m=><option key={m}>{m}</option>)}
+                      </select>
+                    </div>
+                    <div style={{gridColumn:"1/-1"}}><div style={{color:"#6b7280",fontSize:11,marginBottom:3}}>YouTube Video Link</div><input value={ex.link||""} onChange={e=>upEx(i,"link",e.target.value)} placeholder="https://youtube.com/…" style={{width:"100%",background:"#18181b",border:"1px solid rgba(255,255,255,.1)",borderRadius:9,padding:"7px 12px",color:"#fff",fontSize:13,outline:"none"}}/></div>
+                    <div style={{gridColumn:"1/-1"}}><div style={{color:"#6b7280",fontSize:11,marginBottom:3}}>Notes</div><input value={ex.notes||""} onChange={e=>upEx(i,"notes",e.target.value)} placeholder="e.g. Keep back straight…" style={{width:"100%",background:"#18181b",border:"1px solid rgba(255,255,255,.1)",borderRadius:9,padding:"7px 12px",color:"#fff",fontSize:13,outline:"none"}}/></div>
+                  </div>
+                </div>
+              ))}
+              <button onClick={()=>setExs(prev=>[...prev,dEx()])} style={{width:"100%",padding:11,background:"none",border:"2px dashed rgba(255,255,255,.1)",borderRadius:12,color:"#6b7280",cursor:"pointer",fontSize:13,display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>
+                <Ic n="Plus" s={15}/>Add Another Exercise
+              </button>
+            </div>
+          </div>
+
+          <div style={{marginBottom:14}}>
+            <label style={{color:"#d1d5db",fontSize:13,fontWeight:600,display:"block",marginBottom:6}}>📋 Workout Notes</label>
+            <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={3} placeholder="e.g. Focus on form today…"
+              style={{width:"100%",background:"#18181b",border:"1px solid rgba(255,255,255,.1)",borderRadius:12,padding:"10px 13px",color:"#fff",fontSize:14,outline:"none",resize:"none"}}/>
+          </div>
+          <div style={{display:"flex",justifyContent:"flex-end"}}>
+            <button onClick={doSave} disabled={saving} style={{background:g,border:"none",color:"#fff",fontWeight:700,padding:"11px 26px",borderRadius:12,cursor:"pointer",fontSize:15,display:"flex",alignItems:"center",gap:8}}>
+              {saving?<Spin s={18} c="#fff"/>:<><Ic n="Save" s={18} c="#fff"/>Save Workout Plan for {mem?.name}</>}
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function PlansTab({plans,g,p,toast,reload}){
+  const [modal,setModal]=useState(false);
+  const [editing,setEditing]=useState(null);
+  const [fm,setFm]=useState({});
+  const [feats,setFeats]=useState("");
+  const [saving,setSaving]=useState(false);
+  const up=v=>setFm(f=>({...f,...v}));
+
+  const openCreate=()=>{setEditing(null);setFm({duration:30,hl:false,badge:""});setFeats("");setModal(true);};
+  const openEdit=pl=>{setEditing(pl);setFm({...pl});setFeats((pl.features||[]).join("\n"));setModal(true);};
+  const doDelete=async id=>{
+    if(!confirm("Delete this plan?"))return;
+    try{await dbDelete("igym_plans",id);toast("Plan deleted","success");reload();}
+    catch(e){toast("Delete failed: "+e.message,"error");}
+  };
+  const doSave=async e=>{
+    e.preventDefault();
+    if(!fm.name?.trim()){toast("Plan name required","error");return;}
+    setSaving(true);
+    try{
+      const docId=editing?.id||"pl"+Date.now();
+      const data={...fm,features:feats.split("\n").map(f=>f.trim()).filter(Boolean),price:parseInt(fm.price)||0,duration:parseInt(fm.duration)||30};
+      delete data.id;
+      await dbSet("igym_plans",docId,data);
+      toast("Plan saved! Landing page updated.","success");
+      setModal(false);reload();
+    }catch(err){toast("Save failed: "+err.message,"error");}
+    setSaving(false);
+  };
+
+  return(
+    <div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10,flexWrap:"wrap",gap:10}}>
+        <div>
+          <h2 style={{color:"#fff",fontWeight:900,fontSize:22}}>Membership Plans</h2>
+          <p style={{color:"#6b7280",fontSize:13,marginTop:3}}>Changes reflect instantly on the landing page</p>
+        </div>
+        <button onClick={openCreate} style={{background:g,border:"none",color:"#fff",fontWeight:700,padding:"10px 18px",borderRadius:12,cursor:"pointer",fontSize:14,display:"flex",alignItems:"center",gap:6}}>
+          <Ic n="Plus" s={16} c="#fff"/>Add Plan
+        </button>
+      </div>
+      <div style={{display:"flex",alignItems:"center",gap:8,background:"rgba(34,197,94,.08)",border:"1px solid rgba(34,197,94,.2)",borderRadius:12,padding:"10px 16px",marginBottom:20}}>
+        <div style={{width:8,height:8,borderRadius:"50%",background:"#22c55e",animation:"pulse 2s infinite",flexShrink:0}}/>
+        <span style={{color:"#4ade80",fontSize:13,fontWeight:600}}>Live sync — changes appear on the landing page immediately</span>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(260px,1fr))",gap:20}}>
+        {plans.length===0?(
+          <div style={{gridColumn:"1/-1",textAlign:"center",padding:52,background:"#18181b",borderRadius:20}}>
+            <Ic n="CreditCard" s={44} c="#374151"/>
+            <p style={{color:"#4b5563",marginTop:14}}>No plans yet. Create your first plan!</p>
+          </div>
+        ):plans.map(pl=>(
+          <div key={pl.id} style={{background:"#18181b",border:"2px solid "+(pl.hl?p:"rgba(255,255,255,.1)"),borderRadius:22,overflow:"hidden"}}>
+            {pl.badge&&<div style={{padding:"10px 18px"}}><span style={{background:g,color:"#fff",fontSize:11,fontWeight:700,padding:"3px 12px",borderRadius:100}}>{pl.badge}</span></div>}
+            <div style={{padding:"16px 20px",borderBottom:"1px solid rgba(255,255,255,.08)"}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
+                <h3 style={{color:"#fff",fontWeight:900,fontSize:20}}>{pl.name}</h3>
+                <div style={{display:"flex",gap:6}}>
+                  <button onClick={()=>openEdit(pl)} style={{padding:"6px 7px",background:p+"15",border:"none",color:p,borderRadius:8,cursor:"pointer",display:"flex"}}><Ic n="Edit" s={14}/></button>
+                  <button onClick={()=>doDelete(pl.id)} style={{padding:"6px 7px",background:"rgba(239,68,68,.1)",border:"none",color:"#f87171",borderRadius:8,cursor:"pointer",display:"flex"}}><Ic n="Trash" s={14}/></button>
+                </div>
+              </div>
+              <div style={{display:"flex",alignItems:"baseline",gap:4}}>
+                <span style={{fontSize:30,fontWeight:900,color:p}}>₹{pl.price.toLocaleString("en-IN")}</span>
+                <span style={{color:"#6b7280",fontSize:13}}>/month</span>
+              </div>
+              {pl.desc&&<p style={{color:"#6b7280",fontSize:13,marginTop:6}}>{pl.desc}</p>}
+            </div>
+            <div style={{padding:"14px 20px"}}>
+              {(pl.features||[]).map(f=>(
+                <div key={f} style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}><Ic n="Check" s={14} c="#22c55e"/><span style={{color:"#d1d5db",fontSize:13}}>{f}</span></div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {modal&&(
+        <Modal title={editing?"Edit — "+editing.name:"Create New Plan"} onClose={()=>setModal(false)}>
+          <form onSubmit={doSave}>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
+              <Field label="Plan Name *" value={fm.name||""} onChange={v=>up({name:v})} placeholder="Premium"/>
+              <Field label="Price (₹)" value={fm.price?.toString()||""} onChange={v=>up({price:parseInt(v)||0})} type="number" placeholder="1999"/>
+              <Field label="Duration (days)" value={fm.duration?.toString()||""} onChange={v=>up({duration:parseInt(v)||30})} type="number" placeholder="30"/>
+              <Field label="Description" value={fm.desc||""} onChange={v=>up({desc:v})} placeholder="Most popular plan"/>
+              <Field label="Badge Text" value={fm.badge||""} onChange={v=>up({badge:v})} placeholder="Most Popular"/>
+              <div style={{display:"flex",alignItems:"center",gap:8,paddingTop:22}}>
+                <input type="checkbox" id="hlck" checked={!!fm.hl} onChange={e=>up({hl:e.target.checked})} style={{width:16,height:16,accentColor:p}}/>
+                <label htmlFor="hlck" style={{color:"#d1d5db",fontSize:14,cursor:"pointer"}}>Highlight (colored border)</label>
+              </div>
+            </div>
+            <div style={{marginBottom:14}}>
+              <label style={{color:"#d1d5db",fontSize:13,fontWeight:600,display:"block",marginBottom:6}}>Features (one per line)</label>
+              <textarea value={feats} onChange={e=>setFeats(e.target.value)} rows={5} placeholder={"Gym Access\nPersonal Trainer (2x/week)\nCustom Diet Plan"}
+                style={{width:"100%",background:"#27272a",border:"1px solid rgba(255,255,255,.12)",borderRadius:12,padding:"10px 13px",color:"#fff",fontSize:14,outline:"none",resize:"none"}}/>
+            </div>
+            <div style={{display:"flex",gap:10}}>
+              <button type="button" onClick={()=>setModal(false)} style={{flex:1,padding:12,background:"#27272a",border:"none",color:"#d1d5db",borderRadius:12,cursor:"pointer",fontWeight:600}}>Cancel</button>
+              <button type="submit" disabled={saving} style={{flex:1,padding:12,background:g,border:"none",color:"#fff",borderRadius:12,cursor:"pointer",fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+                {saving?<Spin s={18} c="#fff"/>:<><Ic n="Save" s={16} c="#fff"/>Save & Sync to Site</>}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+//  ROOT APP
+// ══════════════════════════════════════════════════════════════
+function App(){
+  const [ready,setReady]=useState(false);
+  const [page,setPage]=useState("landing");
+  const [td,setTd]=useState(null);
+
+  useEffect(()=>{
+    seedDB().then(async()=>{
+      // Pull remote config so site customizer changes sync across devices
+      try{await getCfgRemote();}catch(e){}
+      const u=getSess();
+      if(u)setPage(u.role==="admin"?"admin":"dashboard");
+      setReady(true);
+    });
+  },[]);
+
+  const toast=(msg,type="success")=>setTd({msg,type,k:Date.now()});
+
+  if(!ready)return(
+    <div style={{minHeight:"100vh",background:"#000",display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:16}}>
+      <div style={{width:60,height:60,borderRadius:16,background:"linear-gradient(135deg,#f97316,#dc2626)",display:"flex",alignItems:"center",justifyContent:"center"}}>
+        <Ic n="Infinity" s={30} c="#fff"/>
+      </div>
+      <Spin s={32} c="#f97316"/>
+      <p style={{color:"#6b7280",fontSize:14}}>Loading InfinityGym…</p>
+    </div>
+  );
+
+  return(
+    <div>
+      {td&&<Toast key={td.k} msg={td.msg} type={td.type} onDone={()=>setTd(null)}/>}
+      <Navbar page={page} setPage={setPage}/>
+      {page==="landing"&&<Landing setPage={setPage}/>}
+      {page==="login"&&<LoginPage setPage={setPage} toast={toast}/>}
+      {page==="adminLogin"&&<AdminLoginPage setPage={setPage} toast={toast}/>}
+      {page==="dashboard"&&<MemberDash setPage={setPage} toast={toast}/>}
+      {page==="admin"&&<AdminDash setPage={setPage} toast={toast}/>}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+//  ADMIN LOGIN PAGE  (only reachable via Site Customizer)
+// ══════════════════════════════════════════════════════════════
+function AdminLoginPage({setPage,toast}){
+  const [id,setId]=useState("");
+  const [pw,setPw]=useState("");
+  const [showPw,setShowPw]=useState(false);
+  const [loading,setLoading]=useState(false);
+  const cfg=getCfg(),g=G(cfg),p=cfg.primary;
+
+  const doLogin=async e=>{
+    e.preventDefault();
+    if(!id.trim()||!pw.trim()){toast("Fill in all fields","error");return;}
+    setLoading(true);
+    try{
+      const members=await dbGetAll("igym_members");
+      const user=members.find(u=>(u.member_id?.toLowerCase()===id.trim().toLowerCase()||u.email?.toLowerCase()===id.trim().toLowerCase())&&u.role==="admin");
+      if(!user){toast("Admin account not found","error");setLoading(false);return;}
+      const ok=await chkPw(pw,user.password_hash);
+      if(!ok){toast("Wrong password","error");setLoading(false);return;}
+      const tok=mkTok({id:user.id,member_id:user.member_id,name:user.name,role:user.role});
+      setSess(tok,{id:user.id,member_id:user.member_id,name:user.name,role:user.role});
+      toast("Welcome, "+user.name+"! 🔐","success");
+      setTimeout(()=>setPage("admin"),600);
+    }catch(err){toast("Login error: "+err.message,"error");}
+    setLoading(false);
+  };
+
+  return(
+    <div style={{minHeight:"100vh",background:"#000",display:"flex",alignItems:"center",justifyContent:"center",padding:"80px 16px 24px"}}>
+      <div style={{width:"100%",maxWidth:400}}>
+        <div style={{textAlign:"center",marginBottom:28}}>
+          <div style={{width:64,height:64,borderRadius:18,background:g,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 14px"}}><Ic n="Shield" s={30} c="#fff"/></div>
+          <h1 style={{color:"#fff",fontWeight:900,fontSize:24,marginBottom:4}}>Admin Access</h1>
+          <p style={{color:"#6b7280",fontSize:13}}>This panel is restricted to administrators only</p>
+        </div>
+        <div style={{background:"#18181b",border:"1px solid rgba(255,255,255,.1)",borderRadius:22,padding:26}}>
+          <form onSubmit={doLogin}>
+            <div style={{marginBottom:14}}><Field label="Admin ID or Email" value={id} onChange={setId} placeholder="ADMIN001"/></div>
+            <div style={{marginBottom:20,position:"relative"}}>
+              <Field label="Password" value={pw} onChange={setPw} type={showPw?"text":"password"} placeholder="Admin password"/>
+              <button type="button" onClick={()=>setShowPw(!showPw)} style={{position:"absolute",right:12,bottom:10,background:"none",border:"none",color:"#6b7280",cursor:"pointer",display:"flex"}}>
+                <Ic n={showPw?"EyeOff":"Eye"} s={17}/>
+              </button>
+            </div>
+            <button type="submit" disabled={loading} style={{width:"100%",background:g,border:"none",color:"#fff",fontWeight:700,padding:13,borderRadius:13,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+              {loading?<Spin s={20} c="#fff"/>:<><Ic n="Shield" s={18} c="#fff"/>Login to Admin Panel</>}
+            </button>
+          </form>
+          <div style={{marginTop:16,padding:12,background:"rgba(249,115,22,.08)",border:"1px solid rgba(249,115,22,.2)",borderRadius:12}}>
+            <p style={{color:"#fb923c",fontSize:12,textAlign:"center"}}>🔒 Access via Site Customizer only · Not publicly listed</p>
+          </div>
+        </div>
+        <button onClick={()=>setPage("landing")} style={{display:"flex",alignItems:"center",gap:6,background:"none",border:"none",color:"#6b7280",cursor:"pointer",margin:"14px auto 0",fontSize:14}}>
+          <Ic n="ChevL" s={16}/>Back to Home
+        </button>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
